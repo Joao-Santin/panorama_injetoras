@@ -1,0 +1,93 @@
+//! Panorama de injetados: coleta as OPs em aberto e o cadastro de produtos
+//! no eGestor (via gateway `egestor-rust-server`) e mostra o levantamento de
+//! necessidades de materiais.
+//!
+//! Uso:
+//!   cargo run --release            → interface gráfica (iced)
+//!   cargo run --release -- --cli   → só coleta e gera a planilha Excel
+//!
+//! Variáveis de ambiente (opcionais):
+//!   EGESTOR_API_URL  URL do gateway (padrão: http://localhost:3000/api)
+//!   SAIDA_DIR        pasta de planilhas/cache (padrão: ./relatorios)
+
+mod api;
+mod calculo;
+mod coleta;
+mod colunas;
+mod fmt;
+mod gui;
+mod modelo;
+mod relatorio;
+
+use anyhow::Result;
+
+fn main() {
+    if std::env::args().any(|a| a == "--cli") {
+        if let Err(e) = executar_cli() {
+            eprintln!("\nERRO: {e:#}");
+            std::process::exit(1);
+        }
+    } else if let Err(e) = gui::executar() {
+        eprintln!("Erro na interface: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn executar_cli() -> Result<()> {
+    let base = coleta::url_api();
+    println!("Gateway: {base}");
+    let mut ultima_etapa = String::new();
+    let brutos = coleta::coletar(&base, &mut |p| {
+        // Imprime só quando muda a "família" da etapa, para não poluir.
+        let familia: String = p.etapa.split_whitespace().take(3).collect::<Vec<_>>().join(" ");
+        if familia != ultima_etapa {
+            println!("  {:>3.0}%  {}", p.fracao * 100.0, p.etapa);
+            ultima_etapa = familia;
+        }
+    })?;
+    coleta::salvar_cache(&brutos)?;
+    let a = coleta::Analise::de(&brutos);
+    let caminho = a.exportar_excel()?;
+    imprimir_resumo(&a);
+    println!("\nPlanilha gerada: {}", caminho.display());
+    Ok(())
+}
+
+fn imprimir_resumo(a: &coleta::Analise) {
+    let (res, tot) = (&a.res, &a.tot);
+    println!("\n================ RESUMO ================");
+    println!("OPs em aberto ..................: {}", tot.num_ops);
+    println!("Itens nas OPs ..................: {}", tot.num_itens);
+    println!("Peças a produzir ...............: {:.0}", tot.pecas);
+    println!("Peso das peças (kg) ............: {:.2}", tot.peso_pecas_kg);
+    println!("Horas-máquina / MO .............: {:.2}", tot.horas_maquina);
+    println!("Materiais necessários ..........: {}", tot.materiais);
+    println!("Materiais com estoque insuf. ...: {}", tot.materiais_em_falta);
+    println!("Valor estimado das faltas ......: R$ {:.2}", tot.valor_faltas);
+
+    let altas: Vec<_> = res.alertas.iter().filter(|a| a.gravidade == "ALTA").collect();
+    println!(
+        "Alertas de cadastro ............: {} ({} de gravidade ALTA — veja a aba Alertas)",
+        res.alertas.len(),
+        altas.len()
+    );
+    for a in &altas {
+        println!("  ! OP {} — {}: {}", a.op.unwrap_or(0), a.descricao, a.mensagem);
+    }
+
+    let faltas: Vec<_> = res.necessidades.iter().filter(|n| !n.mao_de_obra && n.falta() > 0.0).collect();
+    if !faltas.is_empty() {
+        println!("\nMateriais em falta (maior custo primeiro):");
+        println!("{:<52} {:>4} {:>12} {:>12} {:>12}", "Material", "Un", "Necessário", "Estoque", "Falta");
+        for x in faltas.iter().take(30) {
+            let nome: String = x.descricao.chars().take(52).collect();
+            println!(
+                "{:<52} {:>4} {:>12.3} {:>12.3} {:>12.3}",
+                nome, x.unidade, x.necessidade, x.estoque, x.falta()
+            );
+        }
+        if faltas.len() > 30 {
+            println!("... e mais {} (veja a planilha)", faltas.len() - 30);
+        }
+    }
+}
