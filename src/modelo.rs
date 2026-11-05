@@ -98,6 +98,11 @@ impl ItemComposicao {
     pub fn qtd_com_perda(&self) -> f64 {
         self.quant * (1.0 + self.perc_perda / 100.0)
     }
+
+    /// Consumo total, já com perda, para produzir `qtd` unidades.
+    pub fn qtd_para(&self, qtd: f64) -> f64 {
+        self.qtd_com_perda() * qtd
+    }
 }
 
 /// Agrupa o relatório `composicoes` por produto. O eGestor pode devolver o mesmo
@@ -139,6 +144,18 @@ pub struct ItemOp {
     pub insumos: Vec<Insumo>,
 }
 
+impl ItemOp {
+    /// Peso líquido de 1 peça, conforme o cadastro (0 se o produto não estiver cadastrado).
+    pub fn peso_un(&self, produtos: &HashMap<i64, Produto>) -> f64 {
+        produtos.get(&self.cod_produto).map_or(0.0, |p| p.peso_liquido)
+    }
+
+    /// Peso líquido de todas as peças deste item.
+    pub fn peso(&self, produtos: &HashMap<i64, Produto>) -> f64 {
+        self.quant * self.peso_un(produtos)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Op {
     pub codigo: i64,
@@ -152,6 +169,16 @@ pub struct Op {
 }
 
 impl Op {
+    /// Total de peças a produzir nesta OP.
+    pub fn pecas(&self) -> f64 {
+        self.itens.iter().map(|i| i.quant).sum()
+    }
+
+    /// Peso líquido total das peças desta OP.
+    pub fn peso(&self, produtos: &HashMap<i64, Produto>) -> f64 {
+        self.itens.iter().map(|i| i.peso(produtos)).sum()
+    }
+
     pub fn from_json(v: &Value) -> Option<Self> {
         let itens = v["produtos"]
             .as_array()
@@ -232,5 +259,31 @@ mod testes {
         assert_eq!(itens[0].qtd_com_perda(), 0.022207);
         assert!((itens[1].qtd_com_perda() - 0.000453 * 1.2).abs() < 1e-12);
         assert!(!mapa.contains_key(&7), "sem insumos = sem composição");
+    }
+
+    #[test]
+    fn consumo_para_uma_quantidade_inclui_a_perda() {
+        let linhas = [json!({"cod": "1", "insumos": [
+            {"codInsumo": "2", "insumo": "X", "quant": "2", "pPerda": "10"}
+        ]})];
+        let mapa = composicoes_de_json(&linhas);
+        assert!((mapa[&1][0].qtd_para(100.0) - 220.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pecas_e_peso_da_op() {
+        // O produto 2 não está no cadastro: conta nas peças, mas pesa 0.
+        let produtos: HashMap<i64, Produto> =
+            [Produto::from_json(&json!({"codigo": 1, "pesoLiquido": 0.5})).unwrap()].into_iter().map(|p| (p.codigo, p)).collect();
+        let op = Op::from_json(&json!({"codigo": 9, "produtos": [
+            {"codProduto": 1, "quant": 10},
+            {"codProduto": 2, "quant": 3},
+        ]}))
+        .unwrap();
+
+        assert_eq!(op.pecas(), 13.0);
+        assert_eq!(op.peso(&produtos), 5.0);
+        assert_eq!(op.itens[0].peso_un(&produtos), 0.5);
+        assert_eq!(op.itens[1].peso_un(&produtos), 0.0);
     }
 }

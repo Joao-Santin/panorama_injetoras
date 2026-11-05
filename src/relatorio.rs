@@ -144,13 +144,10 @@ pub fn totais(ops: &[Op], produtos: &HashMap<i64, Produto>, res: &Resultado) -> 
         num_ops: ops.len(),
         num_itens: itens.len(),
         pecas: itens.iter().map(|i| i.quant).sum(),
-        peso_pecas_kg: itens
-            .iter()
-            .map(|i| i.quant * produtos.get(&i.cod_produto).map(|p| p.peso_liquido).unwrap_or(0.0))
-            .sum(),
+        peso_pecas_kg: itens.iter().map(|i| i.peso(produtos)).sum(),
         materiais: materiais.len(),
         materiais_em_falta: materiais.iter().filter(|n| n.falta() > 0.0).count(),
-        valor_faltas: materiais.iter().map(|n| n.falta() * n.custo_unit).sum(),
+        valor_faltas: materiais.iter().map(|n| n.custo_falta()).sum(),
         horas_maquina: res.necessidades.iter().filter(|n| n.mao_de_obra).map(|n| n.necessidade).sum(),
     }
 }
@@ -269,8 +266,8 @@ pub fn gerar(
             n(x.estoque_minimo),
             n(x.comprar_com_minimo()),
             n(x.custo_unit),
-            n(x.necessidade * x.custo_unit),
-            n(x.falta() * x.custo_unit),
+            n(x.custo_necessidade()),
+            n(x.custo_falta()),
             t(if x.controla_estoque { "Sim" } else { "Não" }),
             n(x.ops.len() as f64),
             t(juntar(x.ops.iter().copied())),
@@ -311,7 +308,7 @@ pub fn gerar(
                     t(&x.unidade),
                     n(x.necessidade),
                     n(x.custo_unit),
-                    n(x.necessidade * x.custo_unit),
+                    n(x.custo_necessidade()),
                     n(x.ops.len() as f64),
                     t(juntar(x.ops.iter().copied())),
                 ]
@@ -389,12 +386,8 @@ pub fn gerar(
         let linhas = ops
             .iter()
             .map(|o| {
-                let pecas: f64 = o.itens.iter().map(|i| i.quant).sum();
-                let peso: f64 = o
-                    .itens
-                    .iter()
-                    .map(|i| i.quant * produtos.get(&i.cod_produto).map(|p| p.peso_liquido).unwrap_or(0.0))
-                    .sum();
+                let pecas = o.pecas();
+                let peso = o.peso(produtos);
                 let nomes = o.itens.iter().map(|i| format!("{} ({})", i.descricao, i.quant)).collect::<Vec<_>>();
                 vec![
                     n(o.codigo as f64),

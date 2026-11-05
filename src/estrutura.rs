@@ -78,10 +78,33 @@ pub struct MaterialSomado<'a> {
     pub custo_total: f64,
 }
 
+/// Custo calculado de 1 unidade comparado com o custo cadastrado no eGestor.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ComparacaoCusto {
+    pub cadastrado: f64,
+    pub diferenca: f64,
+    pub percentual: f64,
+}
+
 impl<'a> Estrutura<'a> {
     /// Custo calculado de 1 unidade do produto raiz.
     pub fn custo_produto(&self) -> f64 {
         self.nos[0].custo_unit
+    }
+
+    /// Custo calculado de toda a quantidade pedida do produto raiz.
+    pub fn custo_total(&self) -> f64 {
+        self.nos[0].custo_total
+    }
+
+    /// O cadastro é por unidade, então a comparação também é: não muda com a quantidade.
+    /// `None` se o produto não tiver custo cadastrado.
+    pub fn comparacao_custo(&self) -> Option<ComparacaoCusto> {
+        let cadastrado = self.nos[0].custo_cadastrado;
+        (cadastrado > 0.0).then(|| {
+            let diferenca = self.custo_produto() - cadastrado;
+            ComparacaoCusto { cadastrado, diferenca, percentual: 100.0 * diferenca / cadastrado }
+        })
     }
 
     /// Materiais da árvore somados por código, do maior para o menor custo.
@@ -343,6 +366,26 @@ mod testes {
         perto(e.nos[2].qtd_por_pai, 3.3);
         perto(e.nos[1].custo_unit, 3.3);
         perto(m[0].custo_unit, 1.0);
+    }
+
+    #[test]
+    fn comparacao_com_cadastro_e_por_unidade() {
+        // Custa R$ 4 por unidade contra R$ 5 cadastrados.
+        let a = analise(&[(1, "A", 5.0, 13), (2, "B", 4.0, 13)], &[(1, &[(2, 1.0, 0.0)])]);
+        for qtd in [1.0, 10.0] {
+            let e = explodir(&a, 1, qtd).unwrap();
+            perto(e.custo_total(), 4.0 * qtd);
+            let c = e.comparacao_custo().unwrap();
+            perto(c.cadastrado, 5.0);
+            perto(c.diferenca, -1.0);
+            perto(c.percentual, -20.0);
+        }
+    }
+
+    #[test]
+    fn sem_custo_cadastrado_nao_ha_comparacao() {
+        let a = analise(&[(1, "A", 0.0, 13), (2, "B", 4.0, 13)], &[(1, &[(2, 1.0, 0.0)])]);
+        assert!(explodir(&a, 1, 1.0).unwrap().comparacao_custo().is_none());
     }
 
     #[test]

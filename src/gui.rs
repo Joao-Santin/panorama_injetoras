@@ -1,7 +1,7 @@
 //! Interface gráfica (iced) do panorama de necessidades de materiais.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeSet, HashSet},
     path::PathBuf,
     sync::Arc,
 };
@@ -657,11 +657,11 @@ impl App {
         // Maiores faltas
         let mut faltas: Vec<&Necessidade> =
             a.res.necessidades.iter().filter(|n| !n.mao_de_obra && n.falta() > 0.0).collect();
-        faltas.sort_by(|x, y| (y.falta() * y.custo_unit).total_cmp(&(x.falta() * x.custo_unit)));
-        let max = faltas.iter().map(|n| n.falta() * n.custo_unit).fold(0.0_f64, f64::max).max(1e-9);
+        faltas.sort_by(|x, y| y.custo_falta().total_cmp(&x.custo_falta()));
+        let max = faltas.iter().map(|n| n.custo_falta()).fold(0.0_f64, f64::max).max(1e-9);
         let mut lista = column![].spacing(10);
         for n in faltas.iter().take(15) {
-            let custo = n.falta() * n.custo_unit;
+            let custo = n.custo_falta();
             lista = lista.push(
                 column![
                     button(text(n.descricao.as_str()).size(13))
@@ -700,7 +700,7 @@ impl App {
             alertas = alertas.push(text("Nenhum alerta de gravidade ALTA.").size(13).style(text::success));
         }
 
-        let mut por_peso: Vec<(&Op, f64)> = a.ops.iter().map(|o| (o, peso_op(o, a))).collect();
+        let mut por_peso: Vec<(&Op, f64)> = a.ops.iter().map(|o| (o, o.peso(&a.produtos))).collect();
         por_peso.sort_by(|x, y| y.1.total_cmp(&x.1));
         let max_peso = por_peso.first().map(|x| x.1).unwrap_or(0.0).max(1e-9);
         let mut pesadas = column![].spacing(6);
@@ -756,16 +756,14 @@ impl App {
             .collect();
         match self.ordem_nec {
             OrdemNec::CustoFalta => linhas.sort_by(|x, y| {
-                (y.falta() * y.custo_unit)
-                    .total_cmp(&(x.falta() * x.custo_unit))
-                    .then(y.falta().total_cmp(&x.falta()))
+                y.custo_falta().total_cmp(&x.custo_falta()).then(y.falta().total_cmp(&x.falta()))
             }),
             OrdemNec::Falta => linhas.sort_by(|x, y| y.falta().total_cmp(&x.falta())),
             OrdemNec::Necessidade => linhas.sort_by(|x, y| y.necessidade.total_cmp(&x.necessidade)),
             OrdemNec::Saldo => linhas.sort_by(|x, y| x.saldo().total_cmp(&y.saldo())),
             OrdemNec::Nome => linhas.sort_by(|x, y| x.descricao.cmp(&y.descricao)),
         }
-        let custo_total: f64 = linhas.iter().map(|n| n.falta() * n.custo_unit).sum();
+        let custo_total: f64 = linhas.iter().map(|n| n.custo_falta()).sum();
 
         let filtros = row![
             text_input("Buscar material, código, categoria ou tag...", &self.busca_nec)
@@ -859,8 +857,8 @@ impl App {
             );
         } else {
             let ops: Vec<&Op> = a.ops.iter().filter(|o| self.grupo_ops.contains(&o.codigo)).collect();
-            let pecas: f64 = ops.iter().flat_map(|o| &o.itens).map(|i| i.quant).sum();
-            let peso: f64 = ops.iter().map(|o| peso_op(o, a)).sum();
+            let pecas: f64 = ops.iter().map(|o| o.pecas()).sum();
+            let peso: f64 = ops.iter().map(|o| o.peso(&a.produtos)).sum();
             let mut chips = row![].spacing(6);
             for o in &ops {
                 chips = chips.push(
@@ -944,31 +942,22 @@ impl App {
             table::column(cab("Un."), |n: &'a Necessidade| cel(n.unidade.as_str())).width(FillPortion(1)),
             col_num("Horas", 2, |n: &'a Necessidade| cel(fmt::num(n.necessidade, 2))),
             col_num("Custo/h", 2, |n: &'a Necessidade| cel(fmt::moeda(n.custo_unit))),
-            col_num("Custo total", 2, |n: &'a Necessidade| cel(fmt::moeda(n.necessidade * n.custo_unit))),
+            col_num("Custo total", 2, |n: &'a Necessidade| cel(fmt::moeda(n.custo_necessidade()))),
             col_num("OPs", 1, |n: &'a Necessidade| cel(n.ops.len().to_string())),
         ];
 
-        // Horas por OP
-        let mut por_op: BTreeMap<i64, (f64, String)> = BTreeMap::new();
-        for d in a.res.detalhe.iter().filter(|d| crate::calculo::eh_mao_de_obra(&d.categoria, &d.insumo)) {
-            let e = por_op.entry(d.op).or_insert((0.0, d.op_tags.clone()));
-            e.0 += d.necessidade;
-        }
-        let mut horas: Vec<(i64, f64, String)> = por_op.into_iter().map(|(k, (h, t))| (k, h, t)).collect();
-        horas.sort_by(|x, y| y.1.total_cmp(&x.1));
-        let max = horas.first().map(|x| x.1).unwrap_or(0.0).max(1e-9);
-        let suspeitas: HashSet<i64> =
-            a.res.alertas.iter().filter(|x| x.tipo == "Consumo de MO suspeito").filter_map(|x| x.op).collect();
+        let horas = a.res.horas_por_op();
+        let max = horas.first().map(|x| x.horas).unwrap_or(0.0).max(1e-9);
 
         let mut lista = column![].spacing(6);
-        for (op, h, tags) in horas {
-            let estilo: EstiloTexto = if suspeitas.contains(&op) { text::danger } else { text::base };
+        for h in horas {
+            let estilo: EstiloTexto = if h.suspeita { text::danger } else { text::base };
             lista = lista.push(
                 row![
-                    button(text(format!("OP {op}")).size(13)).padding(0).style(button::text).on_press(Message::VerOp(op)).width(80),
-                    text(tags).size(12).style(text::secondary).width(260),
-                    progress_bar(0.0..=max as f32, h as f32).girth(10),
-                    text(format!("{} h{}", fmt::num(h, 1), if suspeitas.contains(&op) { "  (verificar!)" } else { "" }))
+                    button(text(format!("OP {}", h.op)).size(13)).padding(0).style(button::text).on_press(Message::VerOp(h.op)).width(80),
+                    text(h.tags).size(12).style(text::secondary).width(260),
+                    progress_bar(0.0..=max as f32, h.horas as f32).girth(10),
+                    text(format!("{} h{}", fmt::num(h.horas, 1), if h.suspeita { "  (verificar!)" } else { "" }))
                         .size(12)
                         .width(170)
                         .align_x(Right)
@@ -991,15 +980,7 @@ impl App {
 
     fn view_ops<'a>(&'a self, a: &'a Analise) -> Element<'a, Message> {
         let busca = self.busca_op.to_lowercase();
-        let faltando: HashSet<i64> = a
-            .res
-            .necessidades
-            .iter()
-            .filter(|n| !n.mao_de_obra && n.falta() > 0.0)
-            .map(|n| n.cod_insumo)
-            .collect();
-        let op_tem_falta =
-            |o: &Op| o.itens.iter().flat_map(|i| &i.insumos).any(|x| faltando.contains(&x.cod_insumo));
+        let ops_com_falta = a.res.ops_com_falta();
 
         let mut lista = column![].spacing(6);
         let mut n = 0;
@@ -1013,7 +994,7 @@ impl App {
             if !contem(&texto_busca, &busca) {
                 continue;
             }
-            let falta = op_tem_falta(o);
+            let falta = ops_com_falta.contains(&o.codigo);
             if self.so_ops_falta && !falta {
                 continue;
             }
@@ -1063,7 +1044,6 @@ impl App {
     }
 
     fn view_detalhe_op<'a>(&'a self, a: &'a Analise, o: &'a Op) -> Element<'a, Message> {
-        let pecas: f64 = o.itens.iter().map(|i| i.quant).sum();
         let no_grupo = self.grupo_ops.contains(&o.codigo);
         let estilo_grupo: EstiloBotao = if no_grupo { button::secondary } else { button::primary };
         let cab_op = column![
@@ -1089,8 +1069,8 @@ impl App {
                 fmt::data(&o.dt_inicio),
                 if o.dt_entrega.is_empty() { "—".to_string() } else { fmt::data(&o.dt_entrega) },
                 o.itens.len(),
-                fmt::qtd(pecas),
-                fmt::num(peso_op(o, a), 1),
+                fmt::qtd(o.pecas()),
+                fmt::num(o.peso(&a.produtos), 1),
                 fmt::moeda(o.valor_total),
             ))
             .size(12)
@@ -1112,7 +1092,6 @@ impl App {
     }
 
     fn view_item_op<'a>(&'a self, a: &'a Analise, item: &'a ItemOp) -> Element<'a, Message> {
-        let peso = a.produtos.get(&item.cod_produto).map(|p| p.peso_liquido).unwrap_or(0.0);
         let estoque_prod = a.produtos.get(&item.cod_produto).map(|p| p.estoque).unwrap_or(0.0);
         let nec: std::collections::HashMap<i64, &'a Necessidade> =
             a.res.necessidades.iter().map(|n| (n.cod_insumo, n)).collect();
@@ -1155,8 +1134,8 @@ impl App {
             text(format!(
                 "{} pç  ·  peso {} kg/pç  ·  total {} kg  ·  estoque do produto {}",
                 fmt::qtd(item.quant),
-                fmt::num(peso, 4),
-                fmt::num(peso * item.quant, 1),
+                fmt::num(item.peso_un(&a.produtos), 4),
+                fmt::num(item.peso(&a.produtos), 1),
                 fmt::qtd(estoque_prod)
             ))
             .size(12)
@@ -1503,22 +1482,20 @@ fn view_soma_materiais<'a>(e: Estrutura<'a>) -> Element<'a, Message> {
 
 /// Todos os custos do produto, somados de baixo para cima a partir dos insumos finais.
 fn view_custeio<'a>(e: Estrutura<'a>) -> Element<'a, Message> {
-    let total = e.nos[0].custo_total;
+    let total = e.custo_total();
     let por_unidade = e.custo_produto();
-    let cadastrado = e.nos[0].custo_cadastrado;
-    // O cadastro é por unidade, então a comparação também é.
-    let comparacao = if cadastrado > 0.0 {
-        let dif = por_unidade - cadastrado;
-        let sinal = if dif > 0.0 { "+" } else { "" };
-        format!(
-            "Custo por unidade: {}  ·  cadastrado no eGestor: {}  ·  diferença: {sinal}{} ({sinal}{}%)",
-            fmt::custo(por_unidade),
-            fmt::custo(cadastrado),
-            fmt::custo(dif),
-            fmt::num(100.0 * dif / cadastrado, 1)
-        )
-    } else {
-        format!("Custo por unidade: {}  ·  sem custo cadastrado no eGestor para comparar.", fmt::custo(por_unidade))
+    let comparacao = match e.comparacao_custo() {
+        Some(c) => {
+            let sinal = if c.diferenca > 0.0 { "+" } else { "" };
+            format!(
+                "Custo por unidade: {}  ·  cadastrado no eGestor: {}  ·  diferença: {sinal}{} ({sinal}{}%)",
+                fmt::custo(por_unidade),
+                fmt::custo(c.cadastrado),
+                fmt::custo(c.diferenca),
+                fmt::num(c.percentual, 1)
+            )
+        }
+        None => format!("Custo por unidade: {}  ·  sem custo cadastrado no eGestor para comparar.", fmt::custo(por_unidade)),
     };
     let aviso = aviso_ciclos(&e);
     let mut col = column![
@@ -1656,7 +1633,7 @@ fn view_composicao<'a>(a: &'a Analise, p: &'a Produto, visao: VisaoComposicao, q
                 col_num("Consumo/pç", 2, |i: I<'a>| cel(fmt::num(i.quant, 6))),
                 col_num("Perda", 1, |i: I<'a>| cel(format!("{}%", fmt::num(i.perc_perda, 2)))),
                 col_num("Consumo c/ perda", 2, |i: I<'a>| cel(fmt::num(i.qtd_com_perda(), 6))),
-                col_num("Qtd. total", 2, move |i: I<'a>| cel(fmt::num(i.qtd_com_perda() * qtd_calculo, 6)).font(NEGRITO)),
+                col_num("Qtd. total", 2, move |i: I<'a>| cel(fmt::num(i.qtd_para(qtd_calculo), 6)).font(NEGRITO)),
             ];
             rolagem(table::table(colunas, itens).padding_x(8).padding_y(3).width(Fill)).into()
         }
@@ -1696,8 +1673,8 @@ fn coluna_necessidade<'a>(c: ColunaNec, sel: Option<i64>) -> table::Column<'a, '
         }),
         ColunaNec::ComprarComMinimo => col_num(titulo, 2, |n: N<'a>| cel(fmt::qtd(n.comprar_com_minimo()))),
         ColunaNec::CustoUnit => col_num(titulo, 2, |n: N<'a>| cel(fmt::moeda(n.custo_unit))),
-        ColunaNec::CustoNecessidade => col_num(titulo, 2, |n: N<'a>| cel(fmt::moeda(n.necessidade * n.custo_unit))),
-        ColunaNec::CustoFalta => col_num(titulo, 2, |n: N<'a>| cel(fmt::moeda(n.falta() * n.custo_unit))),
+        ColunaNec::CustoNecessidade => col_num(titulo, 2, |n: N<'a>| cel(fmt::moeda(n.custo_necessidade()))),
+        ColunaNec::CustoFalta => col_num(titulo, 2, |n: N<'a>| cel(fmt::moeda(n.custo_falta()))),
         ColunaNec::ControlaEstoque => {
             table::column(cab(titulo), |n: N<'a>| cel(if n.controla_estoque { "Sim" } else { "Não" })).width(FillPortion(1))
         }
@@ -1720,13 +1697,6 @@ fn coluna_necessidade<'a>(c: ColunaNec, sel: Option<i64>) -> table::Column<'a, '
         })
         .width(FillPortion(3)),
     }
-}
-
-fn peso_op(o: &Op, a: &Analise) -> f64 {
-    o.itens
-        .iter()
-        .map(|i| i.quant * a.produtos.get(&i.cod_produto).map(|p| p.peso_liquido).unwrap_or(0.0))
-        .sum()
 }
 
 fn cab<'a>(s: &'a str) -> iced::widget::Text<'a> {
