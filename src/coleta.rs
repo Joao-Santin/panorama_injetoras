@@ -3,14 +3,14 @@
 
 use std::{collections::HashMap, path::PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::{
     api::Api,
     calculo::{self, Resultado},
-    modelo::{Op, Produto},
+    modelo::{self, ItemComposicao, Op, Produto},
     relatorio::{self, Totais},
 };
 
@@ -22,6 +22,11 @@ pub struct DadosBrutos {
     pub gerado_em: String,
     pub ops: Vec<Value>,
     pub produtos: Vec<Value>,
+    /// Relatório `composicoes`. `None` = cache antigo, coletado antes deste campo existir.
+    #[serde(default)]
+    pub composicoes: Option<Vec<Value>>,
+    #[serde(default)]
+    pub categorias: Vec<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -63,6 +68,15 @@ pub fn coletar(base: &str, progresso: &mut dyn FnMut(Progresso)) -> Result<Dados
     let mut api = Api::new(base)?;
     progresso(prog("Conectando ao gateway...", 0.0));
     api.health()?;
+
+    // Composições cadastradas e categorias: chamadas rápidas, feitas antes da parte demorada.
+    progresso(prog("Lendo composições cadastradas...", 0.0));
+    let filtros = json!({ "codProds": "", "categoria": "", "tags": "" });
+    let Value::Array(composicoes) = api.post("/relatorios/composicoes", &filtros)? else {
+        bail!("O relatório de composições não devolveu uma lista");
+    };
+    progresso(prog("Lendo categorias...", 0.0));
+    let categorias = api.get_todas_paginas("/categorias", &mut |_, _, _| {})?;
 
     // 1) Lista de OPs em aberto (0% – 5%)
     let lista = api.get_todas_paginas(&format!("/producao?situacao={SITUACAO_ABERTA}"), &mut |p, u, _| {
@@ -119,6 +133,8 @@ pub fn coletar(base: &str, progresso: &mut dyn FnMut(Progresso)) -> Result<Dados
         gerado_em: chrono::Local::now().format("%d/%m/%Y %H:%M").to_string(),
         ops,
         produtos,
+        composicoes: Some(composicoes),
+        categorias,
     })
 }
 
@@ -127,6 +143,9 @@ pub struct Analise {
     pub gerado_em: String,
     pub ops: Vec<Op>,
     pub produtos: HashMap<i64, Produto>,
+    /// Composição cadastrada de cada produto. `None` = ainda não coletada (cache antigo).
+    pub composicoes: Option<HashMap<i64, Vec<ItemComposicao>>>,
+    pub categorias: HashMap<i64, String>,
     pub res: Resultado,
     pub tot: Totais,
 }
@@ -139,7 +158,22 @@ impl Analise {
             d.produtos.iter().filter_map(Produto::from_json).map(|p| (p.codigo, p)).collect();
         let res = calculo::calcular(&ops, &produtos);
         let tot = relatorio::totais(&ops, &produtos, &res);
-        Self { gerado_em: d.gerado_em.clone(), ops, produtos, res, tot }
+        let composicoes = d.composicoes.as_deref().map(modelo::composicoes_de_json);
+        let categorias = d
+            .categorias
+            .iter()
+            .filter_map(|c| Some((c["codigo"].as_i64()?, modelo::texto(&c["nome"]))))
+            .collect();
+        Self { gerado_em: d.gerado_em.clone(), ops, produtos, composicoes, categorias, res, tot }
+    }
+
+    /// Nome da categoria de um produto do cadastro.
+    pub fn categoria_de(&self, cod_categoria: i64) -> &str {
+        match self.categorias.get(&cod_categoria) {
+            Some(nome) => nome,
+            None if cod_categoria == 0 => "Sem categoria",
+            None => "—",
+        }
     }
 
     /// Gera a planilha Excel e devolve o caminho.

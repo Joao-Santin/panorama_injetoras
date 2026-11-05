@@ -39,6 +39,11 @@ pub fn moeda(v: f64) -> String {
     format!("R$\u{a0}{}", num(v, 2))
 }
 
+/// Custo unitário: 4 casas, pois há itens de frações de centavo.
+pub fn custo(v: f64) -> String {
+    format!("R$\u{a0}{}", num(v, 4))
+}
+
 /// "2026-11-01" → "01/11/2026"; mantém o texto se não for nesse formato.
 pub fn data(s: &str) -> String {
     let d = s.get(..10).unwrap_or(s);

@@ -14,6 +14,7 @@ mod api;
 mod calculo;
 mod coleta;
 mod colunas;
+mod estrutura;
 mod fmt;
 mod gui;
 mod modelo;

@@ -1,6 +1,8 @@
 //! Estruturas de dados lidas do eGestor. A leitura é tolerante: campos
 //! ausentes viram 0/"" e números que venham como texto são convertidos.
 
+use std::collections::HashMap;
+
 use serde_json::Value;
 
 pub fn num(v: &Value) -> f64 {
@@ -24,6 +26,11 @@ fn tags(v: &Value) -> Vec<String> {
     v.as_array().map(|a| a.iter().map(texto).collect()).unwrap_or_default()
 }
 
+/// Os relatórios do eGestor devolvem até os códigos como texto.
+fn inteiro(v: &Value) -> Option<i64> {
+    v.as_i64().or_else(|| v.as_str()?.trim().parse().ok())
+}
+
 #[derive(Debug, Clone)]
 pub struct Produto {
     pub codigo: i64,
@@ -39,6 +46,8 @@ pub struct Produto {
     pub preco_venda: f64,
     pub tipo: String,
     pub tags: Vec<String>,
+    /// 0 = produto sem categoria.
+    pub cod_categoria: i64,
 }
 
 impl Produto {
@@ -57,8 +66,56 @@ impl Produto {
             preco_venda: num(&v["precoVenda"]),
             tipo: texto(&v["tipoProduto"]),
             tags: tags(&v["tags"]),
+            cod_categoria: inteiro(&v["codCategoria"]).unwrap_or(0),
         })
     }
+}
+
+/// Um insumo da composição cadastrada de um produto (relatório `composicoes`).
+#[derive(Debug, Clone)]
+pub struct ItemComposicao {
+    pub cod_insumo: i64,
+    pub codigo_proprio: String,
+    pub descricao: String,
+    pub unidade: String,
+    /// Consumo por unidade produzida, sem perda.
+    pub quant: f64,
+    pub perc_perda: f64,
+}
+
+impl ItemComposicao {
+    fn from_json(v: &Value) -> Option<Self> {
+        Some(Self {
+            cod_insumo: inteiro(&v["codInsumo"])?,
+            codigo_proprio: texto(&v["codProprio"]),
+            descricao: texto(&v["insumo"]),
+            unidade: texto(&v["unidade"]),
+            quant: num(&v["quant"]),
+            perc_perda: num(&v["pPerda"]),
+        })
+    }
+
+    pub fn qtd_com_perda(&self) -> f64 {
+        self.quant * (1.0 + self.perc_perda / 100.0)
+    }
+}
+
+/// Agrupa o relatório `composicoes` por produto. O eGestor pode devolver o mesmo
+/// produto em várias linhas, cada uma com parte dos insumos (ex.: a resina numa e
+/// o master na outra), por isso as linhas são somadas, nunca sobrescritas.
+pub fn composicoes_de_json(linhas: &[Value]) -> HashMap<i64, Vec<ItemComposicao>> {
+    let mut mapa: HashMap<i64, Vec<ItemComposicao>> = HashMap::new();
+    for linha in linhas {
+        let Some(codigo) = inteiro(&linha["cod"]) else { continue };
+        let itens: Vec<ItemComposicao> = linha["insumos"]
+            .as_array()
+            .map(|a| a.iter().filter_map(ItemComposicao::from_json).collect())
+            .unwrap_or_default();
+        if !itens.is_empty() {
+            mapa.entry(codigo).or_default().extend(itens);
+        }
+    }
+    mapa
 }
 
 #[derive(Debug, Clone)]
@@ -148,5 +205,32 @@ impl Op {
             valor_total: num(&v["valorTotal"]),
             itens,
         })
+    }
+}
+
+#[cfg(test)]
+mod testes {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn composicao_em_varias_linhas_e_somada() {
+        let linhas = [
+            json!({"cod": "1004", "produto": "  PORTA CHUPETA", "insumos": [
+                {"codInsumo": "50", "insumo": "RESINA", "codProprio": "3000050", "unidade": "KG", "quant": "0.022207", "pPerda": "0.0000"}
+            ]}),
+            json!({"cod": "1004", "produto": "  PORTA CHUPETA", "insumos": [
+                {"codInsumo": "140", "insumo": "MASTER", "codProprio": "3000140", "unidade": "KG", "quant": "0.000453", "pPerda": "20.0000"}
+            ]}),
+            json!({"cod": "7", "produto": "SEM INSUMOS", "insumos": []}),
+        ];
+        let mapa = composicoes_de_json(&linhas);
+
+        let itens = &mapa[&1004];
+        assert_eq!(itens.iter().map(|i| i.cod_insumo).collect::<Vec<_>>(), [50, 140]);
+        assert_eq!(itens[0].qtd_com_perda(), 0.022207);
+        assert!((itens[1].qtd_com_perda() - 0.000453 * 1.2).abs() < 1e-12);
+        assert!(!mapa.contains_key(&7), "sem insumos = sem composição");
     }
 }

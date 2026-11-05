@@ -9,6 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use reqwest::Method;
 use serde_json::Value;
 
 /// Intervalo mínimo entre requisições (60 req/min no eGestor → ~1 por segundo).
@@ -45,6 +46,15 @@ impl Api {
 
     /// GET em `{base}{caminho}` (caminho já com query string, se houver).
     pub fn get(&mut self, caminho: &str) -> Result<Value> {
+        self.requisitar(Method::GET, caminho, None)
+    }
+
+    /// POST em `{base}{caminho}` com corpo JSON (usado pelos relatórios do eGestor).
+    pub fn post(&mut self, caminho: &str, corpo: &Value) -> Result<Value> {
+        self.requisitar(Method::POST, caminho, Some(corpo))
+    }
+
+    fn requisitar(&mut self, metodo: Method, caminho: &str, corpo: Option<&Value>) -> Result<Value> {
         let url = format!("{}{}", self.base, caminho);
         for tentativa in 1..=MAX_TENTATIVAS {
             if let Some(t) = self.ultima {
@@ -55,14 +65,18 @@ impl Api {
             }
             self.ultima = Some(Instant::now());
 
-            let resp = match self.http.get(&url).send() {
+            let mut req = self.http.request(metodo.clone(), &url);
+            if let Some(c) = corpo {
+                req = req.json(c);
+            }
+            let resp = match req.send() {
                 Ok(r) => r,
                 Err(e) if tentativa < MAX_TENTATIVAS => {
                     eprintln!("  ! erro de rede em {caminho} ({e}); tentando de novo...");
                     thread::sleep(Duration::from_secs(3));
                     continue;
                 }
-                Err(e) => return Err(e).with_context(|| format!("GET {url}")),
+                Err(e) => return Err(e).with_context(|| format!("{metodo} {url}")),
             };
 
             let status = resp.status();
@@ -74,11 +88,11 @@ impl Api {
             }
             if !status.is_success() {
                 let corpo = resp.text().unwrap_or_default();
-                bail!("GET {url} → {status}: {corpo}");
+                bail!("{metodo} {url} → {status}: {corpo}");
             }
-            return resp.json().with_context(|| format!("JSON inválido em GET {url}"));
+            return resp.json().with_context(|| format!("JSON inválido em {metodo} {url}"));
         }
-        bail!("GET {url}: desisti após {MAX_TENTATIVAS} tentativas")
+        bail!("{metodo} {url}: desisti após {MAX_TENTATIVAS} tentativas")
     }
 
     /// Lê todas as páginas de uma listagem (`data`, `last_page`).

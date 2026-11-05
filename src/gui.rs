@@ -13,21 +13,25 @@ use iced::{
     Task, Theme, font,
     alignment::Horizontal::Right,
     widget::{
-        Column, button, center, checkbox, column, container, pick_list, progress_bar, row, rule, scrollable, space,
-        table, text, text_input, toggler,
+        Column, button, center, checkbox, column, container, operation, pick_list, progress_bar, row, rule, scrollable,
+        space, table, text, text_input, toggler,
     },
 };
 
 use crate::{
     calculo::{self, Alerta, Necessidade, Resultado},
     coleta::{self, Analise, DadosBrutos, Progresso},
-    colunas::{ColunaNec, ConfigColunas},
+    colunas::{AcaoColuna, Coluna, ColunaNec, ColunaProd, ConfigColunas},
+    estrutura::{self, Estrutura, No, TipoNo},
     fmt,
-    modelo::{ItemOp, Op, Produto},
+    modelo::{ItemComposicao, ItemOp, Op, Produto},
 };
 
 const NEGRITO: Font = Font { weight: font::Weight::Bold, ..Font::DEFAULT };
-const MAX_LINHAS_PRODUTOS: usize = 300;
+const ITENS_POR_PAGINA: usize = 300;
+const ID_LISTA_PRODUTOS: &str = "lista_produtos";
+const AVISO_SEM_COMPOSICOES: &str =
+    "Composições e categorias ainda não coletadas: clique em \"Atualizar do eGestor\" para buscá-las.";
 
 type EstiloTexto = fn(&Theme) -> text::Style;
 type EstiloBotao = fn(&Theme, button::Status) -> button::Style;
@@ -49,6 +53,22 @@ pub enum Aba {
     MaoDeObra,
     Ops,
     Alertas,
+    Produtos,
+}
+
+/// O que o banner da aba Produtos mostra do item selecionado.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisaoComposicao {
+    /// Só o primeiro nível, como está cadastrado.
+    Direta,
+    Bom,
+    Custeio,
+}
+
+/// Tabelas com colunas configuráveis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tabela {
+    Necessidades,
     Produtos,
 }
 
@@ -146,10 +166,7 @@ pub enum Message {
     GrupoAlternar(i64),
     GrupoRemover(i64),
     GrupoLimpar,
-    ColunaVisivel(usize, bool),
-    ColunaMover(usize, usize),
-    ColunasMostrarTodas,
-    ColunasPadrao,
+    Colunas(Tabela, AcaoColuna),
     SelMaterial(i64),
     FecharMaterial,
     VerMaterial(i64),
@@ -160,6 +177,31 @@ pub enum Message {
     FiltroGrav(FiltroGrav),
     BuscaProd(String),
     SoUsados(bool),
+    ModoConfigProd(bool),
+    SelProduto(i64),
+    FecharProduto,
+    PaginaProd(usize),
+    VisaoComposicao(VisaoComposicao),
+}
+
+/// Recorte de uma lista em páginas de `ITENS_POR_PAGINA`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Paginacao {
+    pagina: usize,
+    ultima: usize,
+    inicio: usize,
+    fim: usize,
+    total: usize,
+}
+
+impl Paginacao {
+    /// A página pedida é limitada à última: a lista pode ter encolhido desde o clique.
+    fn de(total: usize, pedida: usize) -> Self {
+        let ultima = total.saturating_sub(1) / ITENS_POR_PAGINA;
+        let pagina = pedida.min(ultima);
+        let inicio = pagina * ITENS_POR_PAGINA;
+        Self { pagina, ultima, inicio, fim: (inicio + ITENS_POR_PAGINA).min(total), total }
+    }
 }
 
 pub struct App {
@@ -172,7 +214,7 @@ pub struct App {
     busca_nec: String,
     so_faltas: bool,
     ordem_nec: OrdemNec,
-    config_nec: ConfigColunas,
+    config_nec: ConfigColunas<ColunaNec>,
     modo_config_nec: bool,
     /// OPs escolhidas para a pesquisa por grupo (vazio = necessidade geral).
     grupo_ops: BTreeSet<i64>,
@@ -186,6 +228,11 @@ pub struct App {
     filtro_grav: FiltroGrav,
     busca_prod: String,
     so_usados: bool,
+    config_prod: ConfigColunas<ColunaProd>,
+    modo_config_prod: bool,
+    produto_sel: Option<i64>,
+    pagina_prod: usize,
+    visao_composicao: VisaoComposicao,
 }
 
 fn iniciar_coleta() -> Task<Message> {
@@ -234,7 +281,12 @@ impl App {
             op_sel: None,
             filtro_grav: FiltroGrav::Todas,
             busca_prod: String::new(),
-            so_usados: true,
+            so_usados: false,
+            config_prod: ConfigColunas::carregar(),
+            modo_config_prod: false,
+            produto_sel: None,
+            pagina_prod: 0,
+            visao_composicao: VisaoComposicao::Direta,
         };
         let task = if sem_cache { iniciar_coleta() } else { Task::none() };
         (app, task)
@@ -345,17 +397,12 @@ impl App {
                 self.grupo_ops.clear();
                 self.recalcular_grupo();
             }
-            Message::ColunaVisivel(..)
-            | Message::ColunaMover(..)
-            | Message::ColunasMostrarTodas
-            | Message::ColunasPadrao => {
-                match msg {
-                    Message::ColunaVisivel(i, v) => self.config_nec.definir_visivel(i, v),
-                    Message::ColunaMover(i, d) => self.config_nec.mover(i, d),
-                    Message::ColunasMostrarTodas => self.config_nec.mostrar_todas(),
-                    _ => self.config_nec = ConfigColunas::default(),
-                }
-                if let Err(e) = self.config_nec.salvar() {
+            Message::Colunas(tabela, acao) => {
+                let salvo = match tabela {
+                    Tabela::Necessidades => self.config_nec.aplicar(acao),
+                    Tabela::Produtos => self.config_prod.aplicar(acao),
+                };
+                if let Err(e) = salvo {
                     self.status = Some((true, format!("Não consegui salvar a configuração de colunas: {e:#}")));
                 }
             }
@@ -373,10 +420,55 @@ impl App {
                 self.aba = Aba::Ops;
             }
             Message::FiltroGrav(f) => self.filtro_grav = f,
-            Message::BuscaProd(s) => self.busca_prod = s,
-            Message::SoUsados(b) => self.so_usados = b,
+            Message::BuscaProd(s) => {
+                self.busca_prod = s;
+                return self.ir_para_pagina_prod(0);
+            }
+            Message::SoUsados(b) => {
+                self.so_usados = b;
+                return self.ir_para_pagina_prod(0);
+            }
+            Message::ModoConfigProd(b) => self.modo_config_prod = b,
+            Message::SelProduto(c) => self.produto_sel = Some(c),
+            Message::FecharProduto => {
+                self.produto_sel = None;
+                self.visao_composicao = VisaoComposicao::Direta;
+            }
+            Message::PaginaProd(p) => return self.ir_para_pagina_prod(p),
+            Message::VisaoComposicao(v) => self.visao_composicao = v,
         }
         Task::none()
+    }
+
+    /// Troca a página e volta a rolagem ao topo, para a nova página começar do primeiro item.
+    fn ir_para_pagina_prod(&mut self, pagina: usize) -> Task<Message> {
+        self.pagina_prod = pagina;
+        operation::snap_to(ID_LISTA_PRODUTOS, scrollable::RelativeOffset::START)
+    }
+
+    /// Produtos que passam pela busca e pelo filtro da aba Produtos (sem ordem definida).
+    fn produtos_filtrados<'a>(&self, a: &'a Analise) -> Vec<&'a Produto> {
+        let busca = self.busca_prod.to_lowercase();
+        let usados: HashSet<i64> = if self.so_usados {
+            a.ops
+                .iter()
+                .flat_map(|o| &o.itens)
+                .flat_map(|i| std::iter::once(i.cod_produto).chain(i.insumos.iter().map(|x| x.cod_insumo)))
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        a.produtos
+            .values()
+            .filter(|p| !self.so_usados || usados.contains(&p.codigo))
+            .filter(|p| {
+                contem(&p.descricao, &busca)
+                    || contem(&p.codigo_proprio, &busca)
+                    || contem(&p.tags.join(" "), &busca)
+                    || contem(a.categoria_de(p.cod_categoria), &busca)
+                    || p.codigo.to_string() == busca
+            })
+            .collect()
     }
 
     /// Refaz o levantamento só com as OPs do grupo (ou volta para o geral se vazio).
@@ -504,7 +596,13 @@ impl App {
             (Aba::MaoDeObra, "Mão de obra".to_string()),
             (Aba::Ops, format!("OPs em aberto ({})", a.ops.len())),
             (Aba::Alertas, format!("Alertas ({}{})", a.res.alertas.len(), if n_alta > 0 { format!(" · {n_alta} ALTA") } else { String::new() })),
-            (Aba::Produtos, format!("Produtos ({})", a.produtos.len())),
+            (
+                Aba::Produtos,
+                match (self.produtos_filtrados(a).len(), a.produtos.len()) {
+                    (filtrados, total) if filtrados == total => format!("Produtos ({total})"),
+                    (filtrados, total) => format!("Produtos ({filtrados} de {total})"),
+                },
+            ),
         ];
         let mut r = row![].spacing(4);
         for (aba, rotulo) in abas {
@@ -662,12 +760,7 @@ impl App {
             pick_list(OrdemNec::TODAS, Some(self.ordem_nec), Message::OrdemNec),
             space::horizontal(),
             text(format!("{} materiais  ·  custo das faltas listadas: {}", linhas.len(), fmt::moeda(custo_total))).size(13),
-            {
-                let estilo: EstiloBotao = if self.modo_config_nec { button::primary } else { button::secondary };
-                button(text(if self.modo_config_nec { "Concluir configuração" } else { "Configurar colunas" }).size(13))
-                    .style(estilo)
-                    .on_press(Message::ModoConfigNec(!self.modo_config_nec))
-            },
+            botao_config_colunas(self.modo_config_nec, Message::ModoConfigNec(!self.modo_config_nec)),
         ]
         .spacing(14)
         .align_y(Center);
@@ -677,7 +770,7 @@ impl App {
         let tabela = rolagem(table::table(colunas, linhas).padding_x(8).padding_y(4).width(Fill));
         // Em modo de configuração, o painel fica à direita da tabela (prévia ao vivo).
         let tabela: Element<'a, Message> = if self.modo_config_nec {
-            row![container(tabela).width(Fill), self.view_config_colunas()].spacing(12).into()
+            row![container(tabela).width(Fill), view_config_colunas(&self.config_nec, Tabela::Necessidades)].spacing(12).into()
         } else {
             tabela.into()
         };
@@ -694,66 +787,6 @@ impl App {
             }
         }
         tela.into()
-    }
-
-    /// Painel do modo de configuração: marcar/desmarcar colunas e mudar a ordem.
-    fn view_config_colunas(&self) -> Element<'_, Message> {
-        let total = self.config_nec.colunas.len();
-        let mut lista = column![].spacing(4);
-        for (i, (c, visivel)) in self.config_nec.colunas.iter().enumerate() {
-            let (c, visivel) = (*c, *visivel);
-            let mut marcador = checkbox(visivel).label(c.rotulo()).text_size(13);
-            if !c.obrigatoria() {
-                marcador = marcador.on_toggle(move |v| Message::ColunaVisivel(i, v));
-            }
-            let seta = |rotulo: &'static str, destino: Option<usize>| {
-                button(text(rotulo).size(13)).padding([2, 8]).style(button::secondary).on_press_maybe(destino.map(|d| Message::ColunaMover(i, d)))
-            };
-            let estilo_ordem: EstiloTexto = if visivel { text::base } else { text::secondary };
-            lista = lista.push(
-                container(
-                    row![
-                        text(format!("{}.", i + 1)).size(12).width(24).style(estilo_ordem),
-                        marcador,
-                        if c.obrigatoria() { text(" (fixa)").size(11).style(text::secondary) } else { text("") },
-                        space::horizontal(),
-                        seta("⤒", (i > 0).then_some(0)),
-                        seta("↑", (i > 0).then(|| i - 1)),
-                        seta("↓", (i + 1 < total).then_some(i + 1)),
-                        seta("⤓", (i + 1 < total).then_some(total - 1)),
-                    ]
-                    .spacing(4)
-                    .align_y(Center),
-                )
-                .padding([3, 6])
-                .style(if visivel { container::rounded_box } else { container::transparent }),
-            );
-        }
-        let n_vis = self.config_nec.visiveis().count();
-        container(
-            column![
-                text("Configurar colunas").size(15).font(NEGRITO),
-                text(format!(
-                    "{n_vis} de {total} visíveis. Marque as que quer ver e use as setas para mudar a ordem \
-                     (⤒ topo · ↑ subir · ↓ descer · ⤓ fim). Salvo automaticamente."
-                ))
-                .size(12)
-                .style(text::secondary),
-                row![
-                    button(text("Mostrar todas").size(12)).style(button::secondary).on_press(Message::ColunasMostrarTodas),
-                    button(text("Restaurar padrão").size(12)).style(button::secondary).on_press(Message::ColunasPadrao),
-                ]
-                .spacing(8),
-                rule::horizontal(1),
-                scrollable(lista.padding(iced::Padding { right: 14.0, ..iced::Padding::ZERO })).height(Fill),
-            ]
-            .spacing(8),
-        )
-        .padding(12)
-        .width(400)
-        .height(Fill)
-        .style(container::bordered_box)
-        .into()
     }
 
     /// Barra "Grupo de OPs": define se a pesquisa é geral ou só de algumas OPs.
@@ -1161,74 +1194,396 @@ impl App {
     // ------------------------------------------------------- Produtos ---
 
     fn view_produtos<'a>(&'a self, a: &'a Analise) -> Element<'a, Message> {
-        let busca = self.busca_prod.to_lowercase();
-        let usados: HashSet<i64> = a
-            .ops
-            .iter()
-            .flat_map(|o| &o.itens)
-            .flat_map(|i| std::iter::once(i.cod_produto).chain(i.insumos.iter().map(|x| x.cod_insumo)))
-            .collect();
-        let mut todos: Vec<&'a Produto> = a
-            .produtos
-            .values()
-            .filter(|p| !self.so_usados || usados.contains(&p.codigo))
-            .filter(|p| {
-                contem(&p.descricao, &busca)
-                    || contem(&p.codigo_proprio, &busca)
-                    || contem(&p.tags.join(" "), &busca)
-                    || p.codigo.to_string() == busca
-            })
-            .collect();
-        todos.sort_by(|x, y| x.descricao.cmp(&y.descricao));
-        let total = todos.len();
-        todos.truncate(MAX_LINHAS_PRODUTOS);
+        let mut todos = self.produtos_filtrados(a);
+        // O código desempata descrições iguais, para cada item ficar sempre na mesma página.
+        todos.sort_by(|x, y| x.descricao.cmp(&y.descricao).then(x.codigo.cmp(&y.codigo)));
+        let pag = Paginacao::de(todos.len(), self.pagina_prod);
+        let linhas = todos[pag.inicio..pag.fim].to_vec();
 
         let filtros = row![
-            text_input("Buscar produto, código ou tag...", &self.busca_prod).on_input(Message::BuscaProd).width(340),
+            text_input("Buscar produto, código, categoria ou tag...", &self.busca_prod).on_input(Message::BuscaProd).width(340),
             toggler(self.so_usados).label("Somente itens usados nas OPs em aberto").on_toggle(Message::SoUsados),
             space::horizontal(),
-            text(if total > MAX_LINHAS_PRODUTOS {
-                format!("mostrando {MAX_LINHAS_PRODUTOS} de {total} — refine a busca")
-            } else {
-                format!("{total} produtos")
-            })
-            .size(13),
+            text(format!("{} produtos", pag.total)).size(13),
+            botao_config_colunas(self.modo_config_prod, Message::ModoConfigProd(!self.modo_config_prod)),
         ]
         .spacing(14)
         .align_y(Center);
 
-        let colunas = vec![
-            col_num("Cód.", 1, |p: &'a Produto| cel(p.codigo.to_string())),
-            table::column(cab("Cód. próprio"), |p: &'a Produto| cel(p.codigo_proprio.as_str())).width(FillPortion(2)),
-            table::column(cab("Descrição"), |p: &'a Produto| {
-                button(text(p.descricao.as_str()).size(13))
-                    .padding([1, 4])
-                    .style(button::text)
-                    .on_press_maybe(usados.contains(&p.codigo).then_some(Message::VerMaterial(p.codigo)))
-            })
-            .width(FillPortion(6)),
-            table::column(cab("Un."), |p: &'a Produto| cel(p.unidade.as_str())).width(FillPortion(1)),
-            col_num("Estoque", 2, |p: &'a Produto| {
-                cel(fmt::qtd(p.estoque)).style(if p.estoque < 0.0 { text::danger } else { text::base })
-            }),
-            col_num("Est. mín.", 2, |p: &'a Produto| cel(fmt::qtd(p.estoque_minimo))),
-            col_num("Peso líq. (kg)", 2, |p: &'a Produto| cel(fmt::num(p.peso_liquido, 4))),
-            col_num("Preço custo", 2, |p: &'a Produto| cel(fmt::moeda(p.preco_custo))),
-            col_num("Preço venda", 2, |p: &'a Produto| cel(fmt::moeda(p.preco_venda))),
-            table::column(cab("Tags"), |p: &'a Produto| cel(p.tags.join(", "))).width(FillPortion(3)),
-        ];
+        let sel = self.produto_sel;
+        let colunas: Vec<_> = self.config_prod.visiveis().map(|c| coluna_produto(c, a, sel)).collect();
+        let mut lista = column![].spacing(8);
+        if pag.ultima > 0 {
+            lista = lista.push(view_paginacao(pag));
+        }
+        lista = lista.push(table::table(colunas, linhas).padding_x(8).padding_y(4).width(Fill));
+        if pag.ultima > 0 {
+            lista = lista.push(view_paginacao(pag));
+        }
+        let tabela = rolagem(lista).id(ID_LISTA_PRODUTOS);
+        // Em modo de configuração, o painel fica à direita da tabela (prévia ao vivo).
+        let tabela: Element<'a, Message> = if self.modo_config_prod {
+            row![container(tabela).width(Fill), view_config_colunas(&self.config_prod, Tabela::Produtos)].spacing(12).into()
+        } else {
+            tabela.into()
+        };
 
-        column![
-            filtros,
-            rolagem(table::table(colunas, todos).padding_x(8).padding_y(4).width(Fill)).height(Fill),
-            text("Clique na descrição de um insumo usado nas OPs para ver a necessidade dele.").size(12).style(text::secondary),
-        ]
-        .spacing(10)
-        .into()
+        let mut tela = column![filtros].spacing(10);
+        match sel.and_then(|c| a.produtos.get(&c)) {
+            Some(p) => {
+                // A árvore multinível precisa de mais espaço que a composição direta.
+                let (lista, banner) = match self.visao_composicao {
+                    VisaoComposicao::Direta => (3, 2),
+                    VisaoComposicao::Bom | VisaoComposicao::Custeio => (1, 2),
+                };
+                tela = tela.push(container(tabela).height(FillPortion(lista)));
+                tela = tela.push(container(view_composicao(a, p, self.visao_composicao)).height(FillPortion(banner)));
+            }
+            None => {
+                tela = tela.push(container(tabela).height(Fill));
+                let dica = if a.composicoes.is_some() {
+                    text("Clique na descrição de um item para ver a composição cadastrada.").size(12).style(text::secondary)
+                } else {
+                    text(AVISO_SEM_COMPOSICOES).size(12).style(text::warning)
+                };
+                tela = tela.push(dica);
+            }
+        }
+        tela.into()
     }
 }
 
 // ============================================================ helpers ===
+
+fn botao_config_colunas<'a>(ativo: bool, ao_clicar: Message) -> Element<'a, Message> {
+    let estilo: EstiloBotao = if ativo { button::primary } else { button::secondary };
+    button(text(if ativo { "Concluir configuração" } else { "Configurar colunas" }).size(13))
+        .style(estilo)
+        .on_press(ao_clicar)
+        .into()
+}
+
+/// Painel do modo de configuração: marcar/desmarcar colunas e mudar a ordem.
+fn view_config_colunas<'a, C: Coluna>(cfg: &'a ConfigColunas<C>, tabela: Tabela) -> Element<'a, Message> {
+    let acao = move |a: AcaoColuna| Message::Colunas(tabela, a);
+    let total = cfg.colunas.len();
+    let mut lista = column![].spacing(4);
+    for (i, (c, visivel)) in cfg.colunas.iter().enumerate() {
+        let (c, visivel) = (*c, *visivel);
+        let mut marcador = checkbox(visivel).label(c.rotulo()).text_size(13);
+        if !c.obrigatoria() {
+            marcador = marcador.on_toggle(move |v| acao(AcaoColuna::Visivel(i, v)));
+        }
+        let seta = |rotulo: &'static str, destino: Option<usize>| {
+            button(text(rotulo).size(13))
+                .padding([2, 8])
+                .style(button::secondary)
+                .on_press_maybe(destino.map(|d| acao(AcaoColuna::Mover(i, d))))
+        };
+        let estilo_ordem: EstiloTexto = if visivel { text::base } else { text::secondary };
+        lista = lista.push(
+            container(
+                row![
+                    text(format!("{}.", i + 1)).size(12).width(24).style(estilo_ordem),
+                    marcador,
+                    if c.obrigatoria() { text(" (fixa)").size(11).style(text::secondary) } else { text("") },
+                    space::horizontal(),
+                    seta("⤒", (i > 0).then_some(0)),
+                    seta("↑", (i > 0).then(|| i - 1)),
+                    seta("↓", (i + 1 < total).then_some(i + 1)),
+                    seta("⤓", (i + 1 < total).then_some(total - 1)),
+                ]
+                .spacing(4)
+                .align_y(Center),
+            )
+            .padding([3, 6])
+            .style(if visivel { container::rounded_box } else { container::transparent }),
+        );
+    }
+    let n_vis = cfg.visiveis().count();
+    container(
+        column![
+            text("Configurar colunas").size(15).font(NEGRITO),
+            text(format!(
+                "{n_vis} de {total} visíveis. Marque as que quer ver e use as setas para mudar a ordem \
+                 (⤒ topo · ↑ subir · ↓ descer · ⤓ fim). Salvo automaticamente."
+            ))
+            .size(12)
+            .style(text::secondary),
+            row![
+                button(text("Mostrar todas").size(12)).style(button::secondary).on_press(acao(AcaoColuna::MostrarTodas)),
+                button(text("Restaurar padrão").size(12)).style(button::secondary).on_press(acao(AcaoColuna::Padrao)),
+            ]
+            .spacing(8),
+            rule::horizontal(1),
+            scrollable(lista.padding(iced::Padding { right: 14.0, ..iced::Padding::ZERO })).height(Fill),
+        ]
+        .spacing(8),
+    )
+    .padding(12)
+    .width(400)
+    .height(Fill)
+    .style(container::bordered_box)
+    .into()
+}
+
+/// Barra de navegação entre páginas, repetida no começo e no fim da lista.
+fn view_paginacao<'a>(p: Paginacao) -> Element<'a, Message> {
+    let botao = |rotulo: &'static str, destino: Option<usize>| {
+        button(text(rotulo).size(13)).padding([3, 10]).style(button::secondary).on_press_maybe(destino.map(Message::PaginaProd))
+    };
+    let tem_anterior = p.pagina > 0;
+    let tem_proxima = p.pagina < p.ultima;
+    row![
+        botao("« Início", tem_anterior.then_some(0)),
+        botao("‹ Anterior", tem_anterior.then(|| p.pagina - 1)),
+        text(format!("Página {} de {}  ·  itens {}–{} de {}", p.pagina + 1, p.ultima + 1, p.inicio + 1, p.fim, p.total)).size(13),
+        botao("Próxima ›", tem_proxima.then(|| p.pagina + 1)),
+        botao("Fim »", tem_proxima.then_some(p.ultima)),
+    ]
+    .spacing(8)
+    .align_y(Center)
+    .into()
+}
+
+/// Monta uma coluna da tabela de Produtos.
+fn coluna_produto<'a>(c: ColunaProd, a: &'a Analise, sel: Option<i64>) -> table::Column<'a, 'a, &'a Produto, Message> {
+    type P<'x> = &'x Produto;
+    let titulo = c.rotulo();
+    match c {
+        ColunaProd::Codigo => col_num(titulo, 1, |p: P<'a>| cel(p.codigo.to_string())),
+        ColunaProd::CodigoProprio => table::column(cab(titulo), |p: P<'a>| cel(p.codigo_proprio.as_str())).width(FillPortion(2)),
+        ColunaProd::Descricao => table::column(cab(titulo), move |p: P<'a>| {
+            let estilo: EstiloBotao = if sel == Some(p.codigo) { button::primary } else { button::text };
+            button(text(p.descricao.as_str()).size(13)).padding([1, 4]).style(estilo).on_press(Message::SelProduto(p.codigo))
+        })
+        .width(FillPortion(6)),
+        ColunaProd::Categoria => {
+            table::column(cab(titulo), move |p: P<'a>| cel(a.categoria_de(p.cod_categoria))).width(FillPortion(2))
+        }
+        ColunaProd::Composicao => table::column(cab(titulo), move |p: P<'a>| match &a.composicoes {
+            None => cel("—").style(text::secondary),
+            Some(m) if m.contains_key(&p.codigo) => cel("Sim").style(text::success),
+            Some(_) => cel("Não").style(text::secondary),
+        })
+        .width(FillPortion(2)),
+        ColunaProd::Unidade => table::column(cab(titulo), |p: P<'a>| cel(p.unidade.as_str())).width(FillPortion(1)),
+        ColunaProd::Estoque => col_num(titulo, 2, |p: P<'a>| {
+            cel(fmt::qtd(p.estoque)).style(if p.estoque < 0.0 { text::danger } else { text::base })
+        }),
+        ColunaProd::EstoqueMinimo => col_num(titulo, 2, |p: P<'a>| cel(fmt::qtd(p.estoque_minimo))),
+        ColunaProd::PesoLiquido => col_num(titulo, 2, |p: P<'a>| cel(fmt::num(p.peso_liquido, 4))),
+        ColunaProd::PrecoCusto => col_num(titulo, 2, |p: P<'a>| cel(fmt::moeda(p.preco_custo))),
+        ColunaProd::PrecoVenda => col_num(titulo, 2, |p: P<'a>| cel(fmt::moeda(p.preco_venda))),
+        ColunaProd::Tags => table::column(cab(titulo), |p: P<'a>| cel(p.tags.join(", "))).width(FillPortion(3)),
+    }
+}
+
+/// Nome do item na árvore, recuado conforme o nível. Compostos em negrito.
+fn celula_item<'a>(n: No<'a>) -> Element<'a, Message> {
+    let nome = cel(n.descricao);
+    let nome = if n.tipo == TipoNo::Composto { nome.font(NEGRITO) } else { nome };
+    container(nome).padding(iced::Padding { left: 18.0 * n.nivel as f32, ..iced::Padding::ZERO }).into()
+}
+
+/// Valor de custo de uma linha da árvore, deixando claro quando ele não é confiável.
+fn celula_custo<'a>(n: No<'a>, valor: f64) -> iced::widget::Text<'a> {
+    match n.tipo {
+        TipoNo::Ciclo => cel("—").style(text::danger),
+        TipoNo::Composto if n.incompleto => cel(format!("{} *", fmt::custo(valor))).style(text::warning),
+        TipoNo::Composto => cel(fmt::custo(valor)).font(NEGRITO),
+        _ if n.incompleto => cel("sem custo").style(text::danger),
+        _ => cel(fmt::custo(valor)),
+    }
+}
+
+fn aviso_ciclos<'a>(e: &Estrutura<'a>) -> Option<Element<'a, Message>> {
+    (!e.ciclos.is_empty()).then(|| {
+        text(format!(
+            "Cadastro circular: {} aparece dentro da própria composição. Esse ramo não foi aberto de novo e não entra no custo. Corrija no eGestor.",
+            e.ciclos.join(", ")
+        ))
+        .size(12)
+        .style(text::danger)
+        .into()
+    })
+}
+
+/// Toda a estrutura do produto, descendo até os insumos finais.
+fn view_bom<'a>(e: Estrutura<'a>) -> Element<'a, Message> {
+    let aviso = aviso_ciclos(&e);
+    let mut col = column![
+        text(format!(
+            "{} níveis  ·  {} itens na estrutura  ·  quantidade total por 1 {}, já com perdas",
+            e.niveis,
+            e.nos.len() - 1,
+            if e.nos[0].unidade.is_empty() { "unidade" } else { e.nos[0].unidade }
+        ))
+        .size(12)
+        .style(text::secondary),
+    ]
+    .spacing(6);
+    col = col.extend(aviso);
+
+    let colunas = vec![
+        table::column(cab("Nível"), |n: No<'a>| cel(n.nivel.to_string())).width(FillPortion(1)),
+        table::column(cab("Item"), |n: No<'a>| celula_item(n)).width(FillPortion(8)),
+        table::column(cab("Cód. próprio"), |n: No<'a>| cel(n.codigo_proprio)).width(FillPortion(2)),
+        table::column(cab("Categoria"), |n: No<'a>| cel(n.categoria)).width(FillPortion(2)),
+        table::column(cab("Tipo"), |n: No<'a>| {
+            cel(n.tipo.rotulo()).style(if n.tipo == TipoNo::Ciclo { text::danger } else { text::base })
+        })
+        .width(FillPortion(3)),
+        table::column(cab("Un."), |n: No<'a>| cel(n.unidade)).width(FillPortion(1)),
+        col_num("Qtd. p/ item acima", 2, |n: No<'a>| cel(fmt::num(n.qtd_por_pai, 6))),
+        col_num("Perda", 1, |n: No<'a>| cel(format!("{}%", fmt::num(n.perc_perda, 2)))),
+        col_num("Qtd. total", 2, |n: No<'a>| cel(fmt::num(n.qtd_total, 6))),
+    ];
+    col.push(rolagem(table::table(colunas, e.nos).padding_x(8).padding_y(3).width(Fill))).into()
+}
+
+/// Todos os custos do produto, somados de baixo para cima a partir dos insumos finais.
+fn view_custeio<'a>(e: Estrutura<'a>) -> Element<'a, Message> {
+    let total = e.custo_produto();
+    let cadastrado = e.nos[0].custo_cadastrado;
+    let comparacao = if cadastrado > 0.0 {
+        let dif = total - cadastrado;
+        let sinal = if dif > 0.0 { "+" } else { "" };
+        format!(
+            "Custo cadastrado no eGestor: {}  ·  diferença: {sinal}{} ({sinal}{}%)",
+            fmt::custo(cadastrado),
+            fmt::custo(dif),
+            fmt::num(100.0 * dif / cadastrado, 1)
+        )
+    } else {
+        "Sem custo cadastrado no eGestor para comparar.".to_string()
+    };
+    let aviso = aviso_ciclos(&e);
+    let mut col = column![
+        text(format!(
+            "Custo calculado: {}{}  =  materiais {}  +  mão de obra {}",
+            fmt::custo(total),
+            if e.nos[0].incompleto { " *" } else { "" },
+            fmt::custo(e.custo_materiais),
+            fmt::custo(e.custo_mao_de_obra)
+        ))
+        .size(14)
+        .font(NEGRITO),
+        text(comparacao).size(12).style(text::secondary),
+    ]
+    .spacing(4);
+    col = col.extend(aviso);
+
+    if !e.sem_custo.is_empty() {
+        const MAX_NOMES: usize = 6;
+        let n = e.sem_custo.len();
+        let mut nomes = e.sem_custo.iter().take(MAX_NOMES).map(|(d, _)| *d).collect::<Vec<_>>().join("; ");
+        if n > MAX_NOMES {
+            nomes.push_str(&format!("; e mais {}", n - MAX_NOMES));
+        }
+        let clientes = if e.sem_custo.iter().any(|(_, c)| *c == "Clientes") {
+            " Os da categoria Clientes podem ser material fornecido pelo cliente."
+        } else {
+            ""
+        };
+        col = col.push(
+            text(format!("* Incompleto: o custo real pode ser maior, pois {n} insumo(s) estão sem custo no cadastro: {nomes}.{clientes}"))
+                .size(12)
+                .style(text::warning),
+        );
+    }
+
+    let base = total.max(1e-12);
+    let colunas = vec![
+        table::column(cab("Nível"), |n: No<'a>| cel(n.nivel.to_string())).width(FillPortion(1)),
+        table::column(cab("Item"), |n: No<'a>| celula_item(n)).width(FillPortion(8)),
+        table::column(cab("Un."), |n: No<'a>| cel(n.unidade)).width(FillPortion(1)),
+        col_num("Qtd. total", 2, |n: No<'a>| cel(fmt::num(n.qtd_total, 6))),
+        col_num("Custo un.", 2, |n: No<'a>| celula_custo(n, n.custo_unit)),
+        col_num("Custo total", 2, |n: No<'a>| celula_custo(n, n.custo_total)),
+        col_num("% do total", 1, move |n: No<'a>| cel(format!("{}%", fmt::num(100.0 * n.custo_total / base, 1)))),
+        col_num("Custo cadastrado un.", 2, |n: No<'a>| {
+            if n.tipo == TipoNo::Composto {
+                cel(fmt::custo(n.custo_cadastrado))
+            } else {
+                cel("—").style(text::secondary)
+            }
+        }),
+    ];
+    col.push(rolagem(table::table(colunas, e.nos).padding_x(8).padding_y(3).width(Fill))).into()
+}
+
+/// Banner inferior da aba Produtos: composição cadastrada do item selecionado.
+fn view_composicao<'a>(a: &'a Analise, p: &'a Produto, visao: VisaoComposicao) -> Element<'a, Message> {
+    let necessarios: HashSet<i64> = a.res.necessidades.iter().map(|n| n.cod_insumo).collect();
+    let itens = a.composicoes.as_ref().and_then(|m| m.get(&p.codigo));
+    let estrutura = estrutura::explodir(a, p.codigo);
+    // Clicar no botão da visão aberta volta para a composição direta.
+    let botao_visao = |rotulo: &'static str, alvo: VisaoComposicao| {
+        let ativo = visao == alvo;
+        let estilo: EstiloBotao = if ativo { button::primary } else { button::secondary };
+        let destino = if ativo { VisaoComposicao::Direta } else { alvo };
+        button(text(rotulo).size(12))
+            .style(estilo)
+            .on_press_maybe(itens.is_some().then_some(Message::VisaoComposicao(destino)))
+    };
+
+    let mut resumo = format!("Cód. {}  ·  {}", p.codigo, a.categoria_de(p.cod_categoria));
+    if let Some(itens) = itens {
+        resumo.push_str(&format!("  ·  {} insumos  ·  consumo por {}", itens.len(), p.unidade));
+    }
+    let mut titulo = row![
+        column![
+            text(p.descricao.as_str()).size(16).font(NEGRITO),
+            text(resumo).size(12).style(text::secondary),
+        ],
+        space::horizontal(),
+    ]
+    .spacing(8)
+    .align_y(Center);
+    titulo = titulo
+        .push(botao_visao("BOM multinível", VisaoComposicao::Bom))
+        .push(botao_visao("Custeio multinível", VisaoComposicao::Custeio));
+    if necessarios.contains(&p.codigo) {
+        titulo = titulo.push(
+            button(text("Ver necessidade deste item").size(12))
+                .on_press(Message::VerMaterial(p.codigo))
+                .style(button::secondary),
+        );
+    }
+    let titulo = titulo.push(button(text("Fechar").size(12)).on_press(Message::FecharProduto).style(button::secondary));
+
+    let corpo: Element<'a, Message> = match (visao, estrutura, itens) {
+        (VisaoComposicao::Bom, Some(e), _) => view_bom(e),
+        (VisaoComposicao::Custeio, Some(e), _) => view_custeio(e),
+        (_, _, Some(itens)) => {
+            type I<'x> = &'x ItemComposicao;
+            let colunas = vec![
+                table::column(cab("Insumo"), move |i: I<'a>| {
+                    button(text(i.descricao.as_str()).size(13))
+                        .padding([1, 4])
+                        .style(button::text)
+                        .on_press_maybe(necessarios.contains(&i.cod_insumo).then_some(Message::VerMaterial(i.cod_insumo)))
+                })
+                .width(FillPortion(6)),
+                table::column(cab("Cód. próprio"), |i: I<'a>| cel(i.codigo_proprio.as_str())).width(FillPortion(2)),
+                table::column(cab("Categoria"), move |i: I<'a>| {
+                    cel(a.produtos.get(&i.cod_insumo).map_or("—", |c| a.categoria_de(c.cod_categoria)))
+                })
+                .width(FillPortion(2)),
+                table::column(cab("Un."), |i: I<'a>| cel(i.unidade.as_str())).width(FillPortion(1)),
+                col_num("Consumo/pç", 2, |i: I<'a>| cel(fmt::num(i.quant, 6))),
+                col_num("Perda", 1, |i: I<'a>| cel(format!("{}%", fmt::num(i.perc_perda, 2)))),
+                col_num("Consumo c/ perda", 2, |i: I<'a>| cel(fmt::num(i.qtd_com_perda(), 6))),
+            ];
+            rolagem(table::table(colunas, itens).padding_x(8).padding_y(3).width(Fill)).into()
+        }
+        _ if a.composicoes.is_none() => text(AVISO_SEM_COMPOSICOES).size(13).style(text::warning).into(),
+        _ => text("Este item não possui composição cadastrada.").size(13).style(text::secondary).into(),
+    };
+
+    container(column![titulo, corpo].spacing(8)).padding(12).style(container::bordered_box).height(Fill).into()
+}
 
 /// Monta uma coluna da tabela de Necessidades.
 fn coluna_necessidade<'a>(c: ColunaNec, sel: Option<i64>) -> table::Column<'a, 'a, &'a Necessidade, Message> {
@@ -1395,4 +1750,30 @@ fn linha_alerta<'a>(al: &'a Alerta) -> Element<'a, Message> {
 /// Área rolável com folga à direita, para a barra de rolagem não cobrir a última coluna.
 fn rolagem<'a>(conteudo: impl Into<Element<'a, Message>>) -> iced::widget::Scrollable<'a, Message> {
     scrollable(container(conteudo).padding(iced::Padding { right: 16.0, ..iced::Padding::ZERO }))
+}
+
+#[cfg(test)]
+mod testes {
+    use super::*;
+
+    #[test]
+    fn paginas_de_300_itens() {
+        let p = Paginacao::de(1787, 0);
+        assert_eq!((p.pagina, p.ultima, p.inicio, p.fim), (0, 5, 0, 300));
+        let p = Paginacao::de(1787, 5);
+        assert_eq!((p.inicio, p.fim), (1500, 1787));
+    }
+
+    #[test]
+    fn limites_da_paginacao() {
+        assert_eq!(Paginacao::de(300, 0).ultima, 0, "exatamente uma página cheia");
+        assert_eq!(Paginacao::de(301, 0).ultima, 1);
+
+        // A lista encolheu (busca/atualização): cai na última página existente.
+        let p = Paginacao::de(10, 4);
+        assert_eq!((p.pagina, p.inicio, p.fim), (0, 0, 10));
+
+        let p = Paginacao::de(0, 0);
+        assert_eq!((p.inicio, p.fim), (0, 0), "lista vazia não pode gerar recorte inválido");
+    }
 }

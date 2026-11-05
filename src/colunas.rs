@@ -1,11 +1,24 @@
-//! Colunas configuráveis da aba Necessidades (quais aparecem e em que ordem).
-//! A configuração é salva em `relatorios/config_colunas_necessidades.json`.
+//! Colunas configuráveis das tabelas (quais aparecem e em que ordem).
+//! Cada tabela salva a própria configuração em `relatorios/`.
 
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::coleta;
+
+/// Uma coluna de uma tabela configurável.
+pub trait Coluna: Copy + PartialEq + Serialize + DeserializeOwned + 'static {
+    /// Ordem padrão, com a visibilidade padrão de cada coluna.
+    const PADRAO: &'static [(Self, bool)];
+    /// Nome do arquivo onde a configuração é salva.
+    const ARQUIVO: &'static str;
+
+    fn rotulo(self) -> &'static str;
+
+    /// Coluna que não pode ser ocultada.
+    fn obrigatoria(self) -> bool;
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ColunaNec {
@@ -30,9 +43,8 @@ pub enum ColunaNec {
     Tags,
 }
 
-impl ColunaNec {
-    /// Ordem padrão, com a visibilidade padrão de cada coluna.
-    pub const PADRAO: [(ColunaNec, bool); 19] = [
+impl Coluna for ColunaNec {
+    const PADRAO: &'static [(Self, bool)] = &[
         (Self::Material, true),
         (Self::CodigoProprio, true),
         (Self::Categoria, true),
@@ -53,8 +65,9 @@ impl ColunaNec {
         (Self::NumProdutos, false),
         (Self::Tags, false),
     ];
+    const ARQUIVO: &'static str = "config_colunas_necessidades.json";
 
-    pub fn rotulo(self) -> &'static str {
+    fn rotulo(self) -> &'static str {
         match self {
             Self::Material => "Material",
             Self::Codigo => "Cód. eGestor",
@@ -78,32 +91,98 @@ impl ColunaNec {
         }
     }
 
-    /// A coluna Material é a que abre o detalhe do material — não pode ser ocultada.
-    pub fn obrigatoria(self) -> bool {
+    /// A coluna Material é a que abre o detalhe do material.
+    fn obrigatoria(self) -> bool {
         self == Self::Material
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ConfigColunas {
-    pub colunas: Vec<(ColunaNec, bool)>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ColunaProd {
+    Codigo,
+    CodigoProprio,
+    Descricao,
+    Categoria,
+    Composicao,
+    Unidade,
+    Estoque,
+    EstoqueMinimo,
+    PesoLiquido,
+    PrecoCusto,
+    PrecoVenda,
+    Tags,
 }
 
-impl Default for ConfigColunas {
-    fn default() -> Self {
-        Self { colunas: ColunaNec::PADRAO.to_vec() }
+impl Coluna for ColunaProd {
+    const PADRAO: &'static [(Self, bool)] = &[
+        (Self::Codigo, true),
+        (Self::CodigoProprio, true),
+        (Self::Descricao, true),
+        (Self::Categoria, true),
+        (Self::Composicao, true),
+        (Self::Unidade, true),
+        (Self::Estoque, true),
+        (Self::EstoqueMinimo, true),
+        (Self::PesoLiquido, true),
+        (Self::PrecoCusto, true),
+        (Self::PrecoVenda, true),
+        (Self::Tags, true),
+    ];
+    const ARQUIVO: &'static str = "config_colunas_produtos.json";
+
+    fn rotulo(self) -> &'static str {
+        match self {
+            Self::Codigo => "Cód.",
+            Self::CodigoProprio => "Cód. próprio",
+            Self::Descricao => "Descrição",
+            Self::Categoria => "Categoria",
+            Self::Composicao => "Composição",
+            Self::Unidade => "Un.",
+            Self::Estoque => "Estoque",
+            Self::EstoqueMinimo => "Est. mín.",
+            Self::PesoLiquido => "Peso líq. (kg)",
+            Self::PrecoCusto => "Preço custo",
+            Self::PrecoVenda => "Preço venda",
+            Self::Tags => "Tags",
+        }
+    }
+
+    /// A coluna Descrição é a que abre a composição do produto.
+    fn obrigatoria(self) -> bool {
+        self == Self::Descricao
     }
 }
 
-fn caminho() -> PathBuf {
-    coleta::pasta_saida().join("config_colunas_necessidades.json")
+/// Mudança pedida no painel "Configurar colunas".
+#[derive(Debug, Clone, Copy)]
+pub enum AcaoColuna {
+    Visivel(usize, bool),
+    Mover(usize, usize),
+    MostrarTodas,
+    Padrao,
 }
 
-impl ConfigColunas {
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(bound = "C: Coluna")]
+pub struct ConfigColunas<C> {
+    pub colunas: Vec<(C, bool)>,
+}
+
+impl<C: Coluna> Default for ConfigColunas<C> {
+    fn default() -> Self {
+        Self { colunas: C::PADRAO.to_vec() }
+    }
+}
+
+fn caminho<C: Coluna>() -> PathBuf {
+    coleta::pasta_saida().join(C::ARQUIVO)
+}
+
+impl<C: Coluna> ConfigColunas<C> {
     /// Carrega do disco; se não existir/for inválido, usa o padrão.
     /// Colunas novas (de versões futuras) entram no fim, ocultas.
     pub fn carregar() -> Self {
-        let mut cfg: Self = std::fs::read(caminho())
+        let mut cfg: Self = std::fs::read(caminho::<C>())
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
@@ -113,7 +192,7 @@ impl ConfigColunas {
             vistas.push(*c);
             nova
         });
-        for (c, _) in ColunaNec::PADRAO {
+        for &(c, _) in C::PADRAO {
             if !vistas.contains(&c) {
                 cfg.colunas.push((c, false));
             }
@@ -128,11 +207,22 @@ impl ConfigColunas {
 
     pub fn salvar(&self) -> anyhow::Result<()> {
         std::fs::create_dir_all(coleta::pasta_saida())?;
-        std::fs::write(caminho(), serde_json::to_vec_pretty(self)?)?;
+        std::fs::write(caminho::<C>(), serde_json::to_vec_pretty(self)?)?;
         Ok(())
     }
 
-    pub fn visiveis(&self) -> impl Iterator<Item = ColunaNec> + '_ {
+    /// Aplica a mudança e salva no disco.
+    pub fn aplicar(&mut self, acao: AcaoColuna) -> anyhow::Result<()> {
+        match acao {
+            AcaoColuna::Visivel(i, v) => self.definir_visivel(i, v),
+            AcaoColuna::Mover(i, destino) => self.mover(i, destino),
+            AcaoColuna::MostrarTodas => self.mostrar_todas(),
+            AcaoColuna::Padrao => *self = Self::default(),
+        }
+        self.salvar()
+    }
+
+    pub fn visiveis(&self) -> impl Iterator<Item = C> + '_ {
         self.colunas.iter().filter(|(_, v)| *v).map(|(c, _)| *c)
     }
 
@@ -164,7 +254,7 @@ mod testes {
 
     #[test]
     fn mover_e_ocultar() {
-        let mut c = ConfigColunas::default();
+        let mut c = ConfigColunas::<ColunaNec>::default();
         c.mover(0, 3);
         assert_eq!(c.colunas[3].0, ColunaNec::Material);
         c.mover(3, 99);
@@ -174,5 +264,20 @@ mod testes {
         assert!(c.colunas[ultima].1, "Material não pode ser ocultada");
         c.definir_visivel(0, false);
         assert!(!c.colunas[0].1);
+    }
+
+    #[test]
+    fn descricao_do_produto_nao_pode_ser_ocultada() {
+        let mut c = ConfigColunas::<ColunaProd>::default();
+        let i = c.colunas.iter().position(|(c, _)| *c == ColunaProd::Descricao).unwrap();
+        c.definir_visivel(i, false);
+        assert!(c.colunas[i].1);
+    }
+
+    #[test]
+    fn formato_do_arquivo_salvo_nao_mudou() {
+        let salvo = r#"{"colunas":[["Material",true],["Tags",false]]}"#;
+        let c: ConfigColunas<ColunaNec> = serde_json::from_str(salvo).unwrap();
+        assert_eq!(c.colunas, [(ColunaNec::Material, true), (ColunaNec::Tags, false)]);
     }
 }
