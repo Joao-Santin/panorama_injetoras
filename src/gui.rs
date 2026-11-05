@@ -22,7 +22,7 @@ use crate::{
     calculo::{self, Alerta, Necessidade, Resultado},
     coleta::{self, Analise, DadosBrutos, Progresso},
     colunas::{AcaoColuna, Coluna, ColunaNec, ColunaProd, ConfigColunas},
-    estrutura::{self, Estrutura, No, TipoNo},
+    estrutura::{self, Estrutura, MaterialSomado, No, TipoNo},
     fmt,
     modelo::{ItemComposicao, ItemOp, Op, Produto},
 };
@@ -30,6 +30,7 @@ use crate::{
 const NEGRITO: Font = Font { weight: font::Weight::Bold, ..Font::DEFAULT };
 const ITENS_POR_PAGINA: usize = 300;
 const ID_LISTA_PRODUTOS: &str = "lista_produtos";
+const QTD_PECAS_PADRAO: &str = "1";
 const AVISO_SEM_COMPOSICOES: &str =
     "Composições e categorias ainda não coletadas: clique em \"Atualizar do eGestor\" para buscá-las.";
 
@@ -62,6 +63,8 @@ pub enum VisaoComposicao {
     /// Só o primeiro nível, como está cadastrado.
     Direta,
     Bom,
+    /// Materiais da BOM somados: quanto de cada um o produto usa no geral.
+    SomaMateriais,
     Custeio,
 }
 
@@ -182,6 +185,7 @@ pub enum Message {
     FecharProduto,
     PaginaProd(usize),
     VisaoComposicao(VisaoComposicao),
+    QtdPecas(String),
 }
 
 /// Recorte de uma lista em páginas de `ITENS_POR_PAGINA`.
@@ -233,6 +237,8 @@ pub struct App {
     produto_sel: Option<i64>,
     pagina_prod: usize,
     visao_composicao: VisaoComposicao,
+    /// Texto do campo de quantidade da composição, como foi digitado.
+    qtd_pecas: String,
 }
 
 fn iniciar_coleta() -> Task<Message> {
@@ -287,6 +293,7 @@ impl App {
             produto_sel: None,
             pagina_prod: 0,
             visao_composicao: VisaoComposicao::Direta,
+            qtd_pecas: QTD_PECAS_PADRAO.into(),
         };
         let task = if sem_cache { iniciar_coleta() } else { Task::none() };
         (app, task)
@@ -429,13 +436,21 @@ impl App {
                 return self.ir_para_pagina_prod(0);
             }
             Message::ModoConfigProd(b) => self.modo_config_prod = b,
-            Message::SelProduto(c) => self.produto_sel = Some(c),
+            Message::SelProduto(c) => {
+                // Cada produto começa em 1: a quantidade de um não vale para o outro.
+                if self.produto_sel != Some(c) {
+                    self.qtd_pecas = QTD_PECAS_PADRAO.into();
+                }
+                self.produto_sel = Some(c);
+            }
             Message::FecharProduto => {
                 self.produto_sel = None;
                 self.visao_composicao = VisaoComposicao::Direta;
+                self.qtd_pecas = QTD_PECAS_PADRAO.into();
             }
             Message::PaginaProd(p) => return self.ir_para_pagina_prod(p),
             Message::VisaoComposicao(v) => self.visao_composicao = v,
+            Message::QtdPecas(s) => self.qtd_pecas = s,
         }
         Task::none()
     }
@@ -1234,10 +1249,10 @@ impl App {
                 // A árvore multinível precisa de mais espaço que a composição direta.
                 let (lista, banner) = match self.visao_composicao {
                     VisaoComposicao::Direta => (3, 2),
-                    VisaoComposicao::Bom | VisaoComposicao::Custeio => (1, 2),
+                    VisaoComposicao::Bom | VisaoComposicao::SomaMateriais | VisaoComposicao::Custeio => (1, 2),
                 };
                 tela = tela.push(container(tabela).height(FillPortion(lista)));
-                tela = tela.push(container(view_composicao(a, p, self.visao_composicao)).height(FillPortion(banner)));
+                tela = tela.push(container(view_composicao(a, p, self.visao_composicao, &self.qtd_pecas)).height(FillPortion(banner)));
             }
             None => {
                 tela = tela.push(container(tabela).height(Fill));
@@ -1409,15 +1424,21 @@ fn aviso_ciclos<'a>(e: &Estrutura<'a>) -> Option<Element<'a, Message>> {
     })
 }
 
+/// Quantidade do produto raiz para os textos, ex.: "10 UN".
+fn qtd_raiz(e: &Estrutura<'_>) -> String {
+    let raiz = &e.nos[0];
+    format!("{} {}", fmt::qtd(raiz.qtd_total), if raiz.unidade.is_empty() { "unidade(s)" } else { raiz.unidade })
+}
+
 /// Toda a estrutura do produto, descendo até os insumos finais.
 fn view_bom<'a>(e: Estrutura<'a>) -> Element<'a, Message> {
     let aviso = aviso_ciclos(&e);
     let mut col = column![
         text(format!(
-            "{} níveis  ·  {} itens na estrutura  ·  quantidade total por 1 {}, já com perdas",
+            "{} níveis  ·  {} itens na estrutura  ·  quantidade total para {}, já com perdas",
             e.niveis,
             e.nos.len() - 1,
-            if e.nos[0].unidade.is_empty() { "unidade" } else { e.nos[0].unidade }
+            qtd_raiz(&e)
         ))
         .size(12)
         .style(text::secondary),
@@ -1442,26 +1463,68 @@ fn view_bom<'a>(e: Estrutura<'a>) -> Element<'a, Message> {
     col.push(rolagem(table::table(colunas, e.nos).padding_x(8).padding_y(3).width(Fill))).into()
 }
 
+/// Quanto de cada material o produto usa no geral, somando todos os subprodutos.
+fn view_soma_materiais<'a>(e: Estrutura<'a>) -> Element<'a, Message> {
+    let materiais = e.materiais_somados();
+    let sem_custo = materiais.iter().filter(|m| m.custo_unit <= 0.0).count();
+    let aviso_custo = if sem_custo > 0 { format!(" ({sem_custo} sem custo cadastrado)") } else { String::new() };
+    let aviso = aviso_ciclos(&e);
+    let mut col = column![
+        text(format!(
+            "{} materiais  ·  custo dos materiais: {}{aviso_custo}  ·  quantidade total para {}, já com perdas  ·  mão de obra não entra",
+            materiais.len(),
+            fmt::custo(e.custo_materiais),
+            qtd_raiz(&e)
+        ))
+        .size(12)
+        .style(text::secondary),
+    ]
+    .spacing(6);
+    col = col.extend(aviso);
+
+    type M<'x> = MaterialSomado<'x>;
+    let celula_valor = |m: M<'a>, valor: f64| {
+        if m.custo_unit > 0.0 { cel(fmt::custo(valor)) } else { cel("sem custo").style(text::danger) }
+    };
+    let base = e.custo_materiais.max(1e-12);
+    let colunas = vec![
+        table::column(cab("Material"), |m: M<'a>| cel(m.descricao)).width(FillPortion(8)),
+        table::column(cab("Cód. próprio"), |m: M<'a>| cel(m.codigo_proprio)).width(FillPortion(2)),
+        table::column(cab("Categoria"), |m: M<'a>| cel(m.categoria)).width(FillPortion(2)),
+        table::column(cab("Un."), |m: M<'a>| cel(m.unidade)).width(FillPortion(1)),
+        col_num("Nº de usos", 1, |m: M<'a>| cel(m.usos.to_string())),
+        col_num("Qtd. total", 2, |m: M<'a>| cel(fmt::num(m.qtd_total, 6)).font(NEGRITO)),
+        col_num("Custo un.", 2, move |m: M<'a>| celula_valor(m, m.custo_unit)),
+        col_num("Custo total", 2, move |m: M<'a>| celula_valor(m, m.custo_total)),
+        col_num("% do custo", 1, move |m: M<'a>| cel(format!("{}%", fmt::num(100.0 * m.custo_total / base, 1)))),
+    ];
+    col.push(rolagem(table::table(colunas, materiais).padding_x(8).padding_y(3).width(Fill))).into()
+}
+
 /// Todos os custos do produto, somados de baixo para cima a partir dos insumos finais.
 fn view_custeio<'a>(e: Estrutura<'a>) -> Element<'a, Message> {
-    let total = e.custo_produto();
+    let total = e.nos[0].custo_total;
+    let por_unidade = e.custo_produto();
     let cadastrado = e.nos[0].custo_cadastrado;
+    // O cadastro é por unidade, então a comparação também é.
     let comparacao = if cadastrado > 0.0 {
-        let dif = total - cadastrado;
+        let dif = por_unidade - cadastrado;
         let sinal = if dif > 0.0 { "+" } else { "" };
         format!(
-            "Custo cadastrado no eGestor: {}  ·  diferença: {sinal}{} ({sinal}{}%)",
+            "Custo por unidade: {}  ·  cadastrado no eGestor: {}  ·  diferença: {sinal}{} ({sinal}{}%)",
+            fmt::custo(por_unidade),
             fmt::custo(cadastrado),
             fmt::custo(dif),
             fmt::num(100.0 * dif / cadastrado, 1)
         )
     } else {
-        "Sem custo cadastrado no eGestor para comparar.".to_string()
+        format!("Custo por unidade: {}  ·  sem custo cadastrado no eGestor para comparar.", fmt::custo(por_unidade))
     };
     let aviso = aviso_ciclos(&e);
     let mut col = column![
         text(format!(
-            "Custo calculado: {}{}  =  materiais {}  +  mão de obra {}",
+            "Custo calculado para {}: {}{}  =  materiais {}  +  mão de obra {}",
+            qtd_raiz(&e),
             fmt::custo(total),
             if e.nos[0].incompleto { " *" } else { "" },
             fmt::custo(e.custo_materiais),
@@ -1514,10 +1577,12 @@ fn view_custeio<'a>(e: Estrutura<'a>) -> Element<'a, Message> {
 }
 
 /// Banner inferior da aba Produtos: composição cadastrada do item selecionado.
-fn view_composicao<'a>(a: &'a Analise, p: &'a Produto, visao: VisaoComposicao) -> Element<'a, Message> {
+fn view_composicao<'a>(a: &'a Analise, p: &'a Produto, visao: VisaoComposicao, qtd_pecas: &'a str) -> Element<'a, Message> {
     let necessarios: HashSet<i64> = a.res.necessidades.iter().map(|n| n.cod_insumo).collect();
     let itens = a.composicoes.as_ref().and_then(|m| m.get(&p.codigo));
-    let estrutura = estrutura::explodir(a, p.codigo);
+    let qtd = fmt::ler_qtd(qtd_pecas);
+    let qtd_calculo = qtd.unwrap_or(1.0);
+    let estrutura = estrutura::explodir(a, p.codigo, qtd_calculo);
     // Clicar no botão da visão aberta volta para a composição direta.
     let botao_visao = |rotulo: &'static str, alvo: VisaoComposicao| {
         let ativo = visao == alvo;
@@ -1530,7 +1595,13 @@ fn view_composicao<'a>(a: &'a Analise, p: &'a Produto, visao: VisaoComposicao) -
 
     let mut resumo = format!("Cód. {}  ·  {}", p.codigo, a.categoria_de(p.cod_categoria));
     if let Some(itens) = itens {
-        resumo.push_str(&format!("  ·  {} insumos  ·  consumo por {}", itens.len(), p.unidade));
+        resumo.push_str(&format!(
+            "  ·  {} insumos  ·  consumo por {}  ·  quantidade total para {} {}",
+            itens.len(),
+            p.unidade,
+            fmt::qtd(qtd_calculo),
+            p.unidade
+        ));
     }
     let mut titulo = row![
         column![
@@ -1541,8 +1612,17 @@ fn view_composicao<'a>(a: &'a Analise, p: &'a Produto, visao: VisaoComposicao) -
     ]
     .spacing(8)
     .align_y(Center);
+    if itens.is_some() {
+        if qtd.is_none() {
+            titulo = titulo.push(text("Quantidade inválida: calculando para 1").size(12).style(text::danger));
+        }
+        titulo = titulo.push(text("Qtd. de peças").size(12)).push(
+            text_input(QTD_PECAS_PADRAO, qtd_pecas).on_input(Message::QtdPecas).size(12).padding([4, 8]).width(90),
+        );
+    }
     titulo = titulo
         .push(botao_visao("BOM multinível", VisaoComposicao::Bom))
+        .push(botao_visao("Soma de materiais", VisaoComposicao::SomaMateriais))
         .push(botao_visao("Custeio multinível", VisaoComposicao::Custeio));
     if necessarios.contains(&p.codigo) {
         titulo = titulo.push(
@@ -1555,6 +1635,7 @@ fn view_composicao<'a>(a: &'a Analise, p: &'a Produto, visao: VisaoComposicao) -
 
     let corpo: Element<'a, Message> = match (visao, estrutura, itens) {
         (VisaoComposicao::Bom, Some(e), _) => view_bom(e),
+        (VisaoComposicao::SomaMateriais, Some(e), _) => view_soma_materiais(e),
         (VisaoComposicao::Custeio, Some(e), _) => view_custeio(e),
         (_, _, Some(itens)) => {
             type I<'x> = &'x ItemComposicao;
@@ -1575,6 +1656,7 @@ fn view_composicao<'a>(a: &'a Analise, p: &'a Produto, visao: VisaoComposicao) -
                 col_num("Consumo/pç", 2, |i: I<'a>| cel(fmt::num(i.quant, 6))),
                 col_num("Perda", 1, |i: I<'a>| cel(format!("{}%", fmt::num(i.perc_perda, 2)))),
                 col_num("Consumo c/ perda", 2, |i: I<'a>| cel(fmt::num(i.qtd_com_perda(), 6))),
+                col_num("Qtd. total", 2, move |i: I<'a>| cel(fmt::num(i.qtd_com_perda() * qtd_calculo, 6)).font(NEGRITO)),
             ];
             rolagem(table::table(colunas, itens).padding_x(8).padding_y(3).width(Fill)).into()
         }

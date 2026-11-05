@@ -44,6 +44,24 @@ pub fn custo(v: f64) -> String {
     format!("R$\u{a0}{}", num(v, 4))
 }
 
+/// Lê uma quantidade digitada, maior que zero, no padrão brasileiro: "1.000" é mil e
+/// "2,5" é dois e meio. Sem vírgula, um ponto só é decimal se não separar milhares ("1.5").
+pub fn ler_qtd(s: &str) -> Option<f64> {
+    let s = s.trim();
+    if !s.chars().all(|c| c.is_ascii_digit() || c == '.' || c == ',') {
+        return None;
+    }
+    let separa_milhares = s.contains('.') && s.split('.').skip(1).all(|g| g.len() == 3);
+    let normalizado = if s.contains(',') {
+        s.replace('.', "").replace(',', ".")
+    } else if separa_milhares {
+        s.replace('.', "")
+    } else {
+        s.to_string()
+    };
+    normalizado.parse().ok().filter(|v: &f64| v.is_finite() && *v > 0.0)
+}
+
 /// "2026-11-01" → "01/11/2026"; mantém o texto se não for nesse formato.
 pub fn data(s: &str) -> String {
     let d = s.get(..10).unwrap_or(s);
@@ -63,5 +81,19 @@ mod testes {
         assert_eq!(num(-0.0001, 2), "0,00");
         assert_eq!(qtd(30000.0), "30.000");
         assert_eq!(data("2026-11-01"), "01/11/2026");
+    }
+
+    #[test]
+    fn le_quantidade_digitada() {
+        assert_eq!(ler_qtd("1"), Some(1.0));
+        assert_eq!(ler_qtd(" 250 "), Some(250.0));
+        assert_eq!(ler_qtd("2,5"), Some(2.5));
+        assert_eq!(ler_qtd("1.000"), Some(1000.0));
+        assert_eq!(ler_qtd("1.000.000"), Some(1_000_000.0));
+        assert_eq!(ler_qtd("1.234,5"), Some(1234.5));
+        assert_eq!(ler_qtd("1.5"), Some(1.5));
+        for invalida in ["", "0", "0,0", "-5", "abc", "1,2,3", "1e5", "inf", "1.2.3"] {
+            assert_eq!(ler_qtd(invalida), None, "{invalida:?}");
+        }
     }
 }
