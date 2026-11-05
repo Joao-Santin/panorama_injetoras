@@ -25,12 +25,14 @@ use crate::{
     estrutura::{self, Estrutura, MaterialSomado, No, TipoNo},
     fmt,
     modelo::{ItemComposicao, ItemOp, Op, Produto},
+    simulacao::{self, Simulacao, Simulado},
 };
 
 const NEGRITO: Font = Font { weight: font::Weight::Bold, ..Font::DEFAULT };
 const ITENS_POR_PAGINA: usize = 300;
 const ID_LISTA_PRODUTOS: &str = "lista_produtos";
 const QTD_PECAS_PADRAO: &str = "1";
+const MAX_RESULTADOS_BUSCA_SIM: usize = 8;
 const AVISO_SEM_COMPOSICOES: &str =
     "Composições e categorias ainda não coletadas: clique em \"Atualizar do eGestor\" para buscá-las.";
 
@@ -81,11 +83,13 @@ pub enum OrdemNec {
     Falta,
     Necessidade,
     Saldo,
+    SaldoOpsSimulacao,
     Nome,
 }
 
 impl OrdemNec {
-    const TODAS: [OrdemNec; 5] = [Self::CustoFalta, Self::Falta, Self::Necessidade, Self::Saldo, Self::Nome];
+    const TODAS: [OrdemNec; 6] =
+        [Self::CustoFalta, Self::Falta, Self::Necessidade, Self::Saldo, Self::SaldoOpsSimulacao, Self::Nome];
 }
 
 impl std::fmt::Display for OrdemNec {
@@ -95,6 +99,7 @@ impl std::fmt::Display for OrdemNec {
             Self::Falta => "Ordenar: maior falta (qtd)",
             Self::Necessidade => "Ordenar: maior necessidade",
             Self::Saldo => "Ordenar: menor saldo",
+            Self::SaldoOpsSimulacao => "Ordenar: menor saldo após OPs e simulação",
             Self::Nome => "Ordenar: nome (A–Z)",
         })
     }
@@ -162,6 +167,13 @@ pub enum Message {
     SoFaltas(bool),
     OrdemNec(OrdemNec),
     ModoConfigNec(bool),
+    ModoSimulacoes(bool),
+    SimBusca(String),
+    SimEscolher(i64),
+    SimQtd(String),
+    SimCriar,
+    SimVer(u64),
+    SimExcluir(u64),
     GrupoEntrada(String),
     GrupoAdicionarEntrada,
     GrupoAdicionarOp(OpcaoOp),
@@ -220,6 +232,15 @@ pub struct App {
     ordem_nec: OrdemNec,
     config_nec: ConfigColunas<ColunaNec>,
     modo_config_nec: bool,
+    modo_simulacoes: bool,
+    simulacoes: Vec<Simulacao>,
+    /// Necessidades em uso (geral ou do grupo) somadas às simulações. É o que a tabela mostra.
+    simulado: Simulado,
+    busca_sim: String,
+    /// Item escolhido na busca; digitar de novo desfaz a escolha.
+    sim_item: Option<i64>,
+    qtd_sim: String,
+    sim_aberta: Option<u64>,
     /// OPs escolhidas para a pesquisa por grupo (vazio = necessidade geral).
     grupo_ops: BTreeSet<i64>,
     /// Necessidades recalculadas só para `grupo_ops` (None = usar a geral).
@@ -265,7 +286,7 @@ impl App {
     fn boot() -> (Self, Task<Message>) {
         let cache = coleta::carregar_cache();
         let sem_cache = cache.is_none();
-        let app = Self {
+        let mut app = Self {
             analise: cache.as_ref().map(Analise::de),
             coletando: sem_cache.then(|| Progresso { etapa: "Iniciando...".into(), fracao: 0.0 }),
             status: (!sem_cache)
@@ -278,6 +299,13 @@ impl App {
             ordem_nec: OrdemNec::CustoFalta,
             config_nec: ConfigColunas::carregar(),
             modo_config_nec: false,
+            modo_simulacoes: false,
+            simulacoes: simulacao::carregar(),
+            simulado: Simulado::default(),
+            busca_sim: String::new(),
+            sim_item: None,
+            qtd_sim: String::new(),
+            sim_aberta: None,
             grupo_ops: BTreeSet::new(),
             res_grupo: None,
             entrada_grupo: String::new(),
@@ -295,6 +323,7 @@ impl App {
             visao_composicao: VisaoComposicao::Direta,
             qtd_pecas: QTD_PECAS_PADRAO.into(),
         };
+        app.recalcular_simulacoes();
         let task = if sem_cache { iniciar_coleta() } else { Task::none() };
         (app, task)
     }
@@ -362,7 +391,47 @@ impl App {
             Message::BuscaNec(s) => self.busca_nec = s,
             Message::SoFaltas(b) => self.so_faltas = b,
             Message::OrdemNec(o) => self.ordem_nec = o,
-            Message::ModoConfigNec(b) => self.modo_config_nec = b,
+            // Os dois painéis ocupam o mesmo lugar: abrir um fecha o outro.
+            Message::ModoConfigNec(b) => {
+                self.modo_config_nec = b;
+                self.modo_simulacoes &= !b;
+            }
+            Message::ModoSimulacoes(b) => {
+                self.modo_simulacoes = b;
+                self.modo_config_nec &= !b;
+            }
+            Message::SimBusca(s) => {
+                self.busca_sim = s;
+                self.sim_item = None;
+            }
+            Message::SimEscolher(c) => {
+                if let Some(p) = self.analise.as_ref().and_then(|a| a.produtos.get(&c)) {
+                    self.busca_sim = p.descricao.clone();
+                    self.sim_item = Some(c);
+                }
+            }
+            Message::SimQtd(s) => self.qtd_sim = s,
+            Message::SimCriar => {
+                if let (Some(cod_produto), Some(quantidade)) = (self.sim_item, fmt::ler_qtd(&self.qtd_sim)) {
+                    let id = simulacao::proximo_id(&self.simulacoes);
+                    self.simulacoes.push(Simulacao { id, cod_produto, quantidade });
+                    self.sim_aberta = Some(id);
+                    self.sim_item = None;
+                    self.busca_sim.clear();
+                    self.qtd_sim.clear();
+                    self.simulacoes_alteradas();
+                }
+            }
+            Message::SimVer(id) => {
+                self.sim_aberta = if self.sim_aberta == Some(id) { None } else { Some(id) };
+            }
+            Message::SimExcluir(id) => {
+                self.simulacoes.retain(|s| s.id != id);
+                if self.sim_aberta == Some(id) {
+                    self.sim_aberta = None;
+                }
+                self.simulacoes_alteradas();
+            }
             Message::GrupoEntrada(s) => self.entrada_grupo = s,
             Message::GrupoAdicionarEntrada => {
                 let abertas: HashSet<i64> = self.analise.iter().flat_map(|a| &a.ops).map(|o| o.codigo).collect();
@@ -495,6 +564,22 @@ impl App {
             }
             _ => None,
         };
+        self.recalcular_simulacoes();
+    }
+
+    /// Refaz as linhas da aba Necessidades: mudou o grupo, os dados ou as simulações.
+    fn recalcular_simulacoes(&mut self) {
+        self.simulado = match &self.analise {
+            Some(a) => simulacao::calcular(a, &self.res_necessidades(a).necessidades, &self.simulacoes),
+            None => Simulado::default(),
+        };
+    }
+
+    fn simulacoes_alteradas(&mut self) {
+        self.recalcular_simulacoes();
+        if let Err(e) = simulacao::salvar(&self.simulacoes) {
+            self.status = Some((true, format!("Não consegui salvar as simulações: {e:#}")));
+        }
     }
 
     /// Resultado usado na aba Necessidades: do grupo, se houver, senão o geral.
@@ -741,8 +826,9 @@ impl App {
     fn view_necessidades<'a>(&'a self, a: &'a Analise) -> Element<'a, Message> {
         let res = self.res_necessidades(a);
         let busca = self.busca_nec.to_lowercase();
-        let mut linhas: Vec<&'a Necessidade> = res
-            .necessidades
+        let mut linhas: Vec<&'a Necessidade> = self
+            .simulado
+            .linhas
             .iter()
             .filter(|n| !n.mao_de_obra)
             .filter(|n| !self.so_faltas || n.falta() > 0.0)
@@ -761,6 +847,9 @@ impl App {
             OrdemNec::Falta => linhas.sort_by(|x, y| y.falta().total_cmp(&x.falta())),
             OrdemNec::Necessidade => linhas.sort_by(|x, y| y.necessidade.total_cmp(&x.necessidade)),
             OrdemNec::Saldo => linhas.sort_by(|x, y| x.saldo().total_cmp(&y.saldo())),
+            OrdemNec::SaldoOpsSimulacao => {
+                linhas.sort_by(|x, y| x.saldo_apos_ops_e_simulacao().total_cmp(&y.saldo_apos_ops_e_simulacao()))
+            }
             OrdemNec::Nome => linhas.sort_by(|x, y| x.descricao.cmp(&y.descricao)),
         }
         let custo_total: f64 = linhas.iter().map(|n| n.custo_falta()).sum();
@@ -773,6 +862,14 @@ impl App {
             pick_list(OrdemNec::TODAS, Some(self.ordem_nec), Message::OrdemNec),
             space::horizontal(),
             text(format!("{} materiais  ·  custo das faltas listadas: {}", linhas.len(), fmt::moeda(custo_total))).size(13),
+            button(text(if self.modo_simulacoes {
+                "Fechar simulações".to_string()
+            } else {
+                format!("Simulações ({})", self.simulacoes.len())
+            })
+            .size(13))
+            .style(if self.modo_simulacoes { button::primary } else { button::secondary })
+            .on_press(Message::ModoSimulacoes(!self.modo_simulacoes)),
             botao_config_colunas(self.modo_config_nec, Message::ModoConfigNec(!self.modo_config_nec)),
         ]
         .spacing(14)
@@ -784,12 +881,14 @@ impl App {
         // Em modo de configuração, o painel fica à direita da tabela (prévia ao vivo).
         let tabela: Element<'a, Message> = if self.modo_config_nec {
             row![container(tabela).width(Fill), view_config_colunas(&self.config_nec, Tabela::Necessidades)].spacing(12).into()
+        } else if self.modo_simulacoes {
+            row![container(tabela).width(Fill), self.view_simulacoes(a)].spacing(12).into()
         } else {
             tabela.into()
         };
 
         let mut tela = column![self.view_grupo_ops(a), filtros].spacing(10);
-        match sel.and_then(|c| res.necessidades.iter().find(|n| n.cod_insumo == c)) {
+        match sel.and_then(|c| self.simulado.linhas.iter().find(|n| n.cod_insumo == c)) {
             Some(n) => {
                 tela = tela.push(container(tabela).height(FillPortion(3)));
                 tela = tela.push(container(self.view_detalhe_material(res, n)).height(FillPortion(2)));
@@ -800,6 +899,138 @@ impl App {
             }
         }
         tela.into()
+    }
+
+    /// Painel lateral: criar, ver e excluir simulações.
+    fn view_simulacoes<'a>(&'a self, a: &'a Analise) -> Element<'a, Message> {
+        let qtd = fmt::ler_qtd(&self.qtd_sim);
+        let mut col = column![
+            text("Simulações").size(15).font(NEGRITO),
+            text(
+                "Produto e quantidade que ainda não viraram OP. Subprodutos usam primeiro o estoque que sobra depois \
+                 das OPs; só a parte que faltar desce até a matéria-prima. Salvo automaticamente."
+            )
+            .size(12)
+            .style(text::secondary),
+            row![
+                text_input("Buscar item por código ou nome...", &self.busca_sim)
+                    .on_input(Message::SimBusca)
+                    .size(13)
+                    .width(Fill),
+                text_input("Qtd.", &self.qtd_sim)
+                    .on_input(Message::SimQtd)
+                    .on_submit(Message::SimCriar)
+                    .size(13)
+                    .width(90),
+            ]
+            .spacing(6),
+        ]
+        .spacing(8);
+
+        if a.composicoes.is_none() {
+            col = col.push(text(AVISO_SEM_COMPOSICOES).size(12).style(text::warning));
+        }
+
+        if self.sim_item.is_none() && !self.busca_sim.trim().is_empty() {
+            let itens = simulacao::buscar_itens(a, &self.busca_sim, MAX_RESULTADOS_BUSCA_SIM);
+            if itens.is_empty() && a.composicoes.is_some() {
+                col = col.push(text("Nenhum item com composição encontrado.").size(12).style(text::secondary));
+            }
+            for p in itens {
+                col = col.push(
+                    button(
+                        column![
+                            text(p.descricao.as_str()).size(12),
+                            text(format!("Cód. {}  ·  {}", p.codigo, p.codigo_proprio)).size(11).style(text::secondary),
+                        ]
+                        .spacing(1),
+                    )
+                    .width(Fill)
+                    .padding([4, 8])
+                    .style(cartao)
+                    .on_press(Message::SimEscolher(p.codigo)),
+                );
+            }
+        }
+
+        if !self.qtd_sim.trim().is_empty() && qtd.is_none() {
+            col = col.push(text("Quantidade inválida.").size(12).style(text::danger));
+        }
+        col = col.push(
+            button(text("Criar simulação").size(13))
+                .style(button::primary)
+                .on_press_maybe((self.sim_item.is_some() && qtd.is_some()).then_some(Message::SimCriar)),
+        );
+        col = col.push(rule::horizontal(1));
+
+        let mut lista = column![].spacing(8);
+        if self.simulacoes.is_empty() {
+            lista = lista.push(text("Nenhuma simulação criada.").size(12).style(text::secondary));
+        }
+        for s in &self.simulacoes {
+            lista = lista.push(self.view_simulacao(a, s));
+        }
+        col = col.push(scrollable(lista.padding(iced::Padding { right: 14.0, ..iced::Padding::ZERO })).height(Fill));
+
+        container(col).padding(12).width(460).height(Fill).style(container::bordered_box).into()
+    }
+
+    /// Uma simulação da lista, com o que ela consome quando aberta.
+    fn view_simulacao<'a>(&'a self, a: &'a Analise, s: &'a Simulacao) -> Element<'a, Message> {
+        let produto = a.produtos.get(&s.cod_produto);
+        let tem_composicao = a.composicoes.as_ref().is_some_and(|m| m.contains_key(&s.cod_produto));
+        let consumos = self.simulado.por_simulacao.get(&s.id).map_or(&[][..], Vec::as_slice);
+        let aberta = self.sim_aberta == Some(s.id);
+
+        let mut col = column![
+            text(produto.map_or_else(|| format!("Item {} (fora do cadastro)", s.cod_produto), |p| p.descricao.clone()))
+                .size(13)
+                .font(NEGRITO),
+            row![
+                text(format!(
+                    "{} {}  ·  {} itens",
+                    fmt::qtd(s.quantidade),
+                    produto.map_or("", |p| p.unidade.as_str()),
+                    consumos.len()
+                ))
+                .size(12)
+                .style(text::secondary),
+                space::horizontal(),
+                button(text(if aberta { "Ocultar" } else { "Ver consumo" }).size(12))
+                    .padding([2, 8])
+                    .style(button::secondary)
+                    .on_press(Message::SimVer(s.id)),
+                button(text("Excluir").size(12)).padding([2, 8]).style(button::danger).on_press(Message::SimExcluir(s.id)),
+            ]
+            .spacing(6)
+            .align_y(Center),
+        ]
+        .spacing(4);
+
+        if !tem_composicao {
+            col = col.push(text("Sem composição cadastrada: não entra no cálculo.").size(12).style(text::danger));
+        }
+        if aberta {
+            for c in consumos {
+                let detalhe = match (c.composto, c.fabricar > 0.0) {
+                    (true, true) => format!("subproduto: fabricar {}", fmt::qtd(c.fabricar)),
+                    (true, false) => "subproduto: sai do estoque".to_string(),
+                    (false, _) => String::new(),
+                };
+                let mut nome = column![text(c.descricao.as_str()).size(12)];
+                if !detalhe.is_empty() {
+                    nome = nome.push(text(detalhe).size(11).style(text::secondary));
+                }
+                col = col.push(
+                    row![
+                        nome.width(Fill),
+                        text(format!("{} {}", fmt::num(c.qtd, 3), c.unidade)).size(12),
+                    ]
+                    .spacing(8),
+                );
+            }
+        }
+        container(col).padding(8).width(Fill).style(container::rounded_box).into()
     }
 
     /// Barra "Grupo de OPs": define se a pesquisa é geral ou só de algumas OPs.
@@ -908,13 +1139,22 @@ impl App {
             column![
                 text(n.descricao.as_str()).size(16).font(NEGRITO),
                 text(format!(
-                    "Necessidade {} {}  ·  estoque {}  ·  saldo {}  ·  {} OPs  ·  {} produtos",
+                    "Necessidade {} {}  ·  estoque {}  ·  saldo {}  ·  {} OPs  ·  {} produtos{}",
                     fmt::qtd(n.necessidade),
                     n.unidade,
                     fmt::qtd(n.estoque),
                     fmt::qtd(n.saldo()),
                     n.ops.len(),
-                    n.produtos.len()
+                    n.produtos.len(),
+                    if n.simulada > 0.0 {
+                        format!(
+                            "  ·  em simulação {}  ·  saldo após OPs e simulação {}",
+                            fmt::qtd(n.simulada),
+                            fmt::qtd(n.saldo_apos_ops_e_simulacao())
+                        )
+                    } else {
+                        String::new()
+                    }
                 ))
                 .size(12)
                 .style(text::secondary),
@@ -1644,6 +1884,11 @@ fn view_composicao<'a>(a: &'a Analise, p: &'a Produto, visao: VisaoComposicao, q
     container(column![titulo, corpo].spacing(8)).padding(12).style(container::bordered_box).height(Fill).into()
 }
 
+fn celula_saldo<'a>(saldo: f64) -> iced::widget::Text<'a> {
+    let e: EstiloTexto = if saldo < 0.0 { text::danger } else { text::success };
+    cel(fmt::qtd(saldo)).style(e)
+}
+
 /// Monta uma coluna da tabela de Necessidades.
 fn coluna_necessidade<'a>(c: ColunaNec, sel: Option<i64>) -> table::Column<'a, 'a, &'a Necessidade, Message> {
     type N<'x> = &'x Necessidade;
@@ -1663,10 +1908,12 @@ fn coluna_necessidade<'a>(c: ColunaNec, sel: Option<i64>) -> table::Column<'a, '
             cel(fmt::qtd(n.estoque)).style(if n.estoque < 0.0 { text::danger } else { text::base })
         }),
         ColunaNec::EstoqueMinimo => col_num(titulo, 2, |n: N<'a>| cel(fmt::qtd(n.estoque_minimo))),
-        ColunaNec::Saldo => col_num(titulo, 2, |n: N<'a>| {
-            let e: EstiloTexto = if n.saldo() < 0.0 { text::danger } else { text::success };
-            cel(fmt::qtd(n.saldo())).style(e)
+        ColunaNec::Saldo => col_num(titulo, 2, |n: N<'a>| celula_saldo(n.saldo())),
+        ColunaNec::NecessidadeSimulacao => col_num(titulo, 2, |n: N<'a>| {
+            if n.simulada > 0.0 { cel(fmt::qtd(n.simulada)) } else { cel("—").style(text::secondary) }
         }),
+        ColunaNec::SaldoAposSimulacao => col_num(titulo, 2, |n: N<'a>| celula_saldo(n.saldo_apos_simulacao())),
+        ColunaNec::SaldoAposOpsESimulacao => col_num(titulo, 2, |n: N<'a>| celula_saldo(n.saldo_apos_ops_e_simulacao())),
         ColunaNec::Falta => col_num(titulo, 2, |n: N<'a>| {
             let e: EstiloTexto = if n.falta() > 0.0 { text::danger } else { text::secondary };
             cel(if n.falta() > 0.0 { fmt::qtd(n.falta()) } else { "—".into() }).style(e).font(NEGRITO)

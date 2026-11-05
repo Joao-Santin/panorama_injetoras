@@ -19,6 +19,7 @@ mod fmt;
 mod gui;
 mod modelo;
 mod relatorio;
+mod simulacao;
 
 use anyhow::Result;
 

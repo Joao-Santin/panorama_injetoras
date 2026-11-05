@@ -19,6 +19,8 @@ pub struct Necessidade {
     pub categoria: String,
     pub unidade: String,
     pub necessidade: f64,
+    /// Consumo previsto pelas simulações. Fica em 0 no levantamento real das OPs.
+    pub simulada: f64,
     pub estoque: f64,
     pub estoque_minimo: f64,
     pub controla_estoque: bool,
@@ -33,6 +35,13 @@ pub struct Necessidade {
 impl Necessidade {
     pub fn saldo(&self) -> f64 {
         self.estoque - self.necessidade
+    }
+    /// Saldo considerando só as simulações, sem as OPs.
+    pub fn saldo_apos_simulacao(&self) -> f64 {
+        self.estoque - self.simulada
+    }
+    pub fn saldo_apos_ops_e_simulacao(&self) -> f64 {
+        self.saldo() - self.simulada
     }
     /// Quanto falta para atender todas as OPs (ignora estoque mínimo).
     pub fn falta(&self) -> f64 {
@@ -288,6 +297,7 @@ pub fn calcular(ops: &[Op], produtos: &HashMap<i64, Produto>) -> Resultado {
                     categoria: ins.categoria.clone(),
                     unidade: unidade.clone(),
                     necessidade: 0.0,
+                    simulada: 0.0,
                     estoque: cad.map(|p| p.estoque).unwrap_or(0.0),
                     estoque_minimo: cad.map(|p| p.estoque_minimo).unwrap_or(0.0),
                     controla_estoque: cad.map(|p| p.controlar_estoque).unwrap_or(false),

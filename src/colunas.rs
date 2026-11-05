@@ -41,6 +41,9 @@ pub enum ColunaNec {
     ListaOps,
     NumProdutos,
     Tags,
+    NecessidadeSimulacao,
+    SaldoAposSimulacao,
+    SaldoAposOpsESimulacao,
 }
 
 impl Coluna for ColunaNec {
@@ -52,6 +55,9 @@ impl Coluna for ColunaNec {
         (Self::Necessidade, true),
         (Self::Estoque, true),
         (Self::Saldo, true),
+        (Self::NecessidadeSimulacao, true),
+        (Self::SaldoAposSimulacao, true),
+        (Self::SaldoAposOpsESimulacao, true),
         (Self::Falta, true),
         (Self::ComprarComMinimo, true),
         (Self::CustoUnit, true),
@@ -88,6 +94,9 @@ impl Coluna for ColunaNec {
             Self::ListaOps => "OPs (lista)",
             Self::NumProdutos => "Nº produtos",
             Self::Tags => "Tags (palavras-chave)",
+            Self::NecessidadeSimulacao => "Necessidade em Simulação",
+            Self::SaldoAposSimulacao => "Saldo após Simulação",
+            Self::SaldoAposOpsESimulacao => "Saldo após OPs e Simulação",
         }
     }
 
@@ -180,29 +189,34 @@ fn caminho<C: Coluna>() -> PathBuf {
 
 impl<C: Coluna> ConfigColunas<C> {
     /// Carrega do disco; se não existir/for inválido, usa o padrão.
-    /// Colunas novas (de versões futuras) entram no fim, ocultas.
     pub fn carregar() -> Self {
-        let mut cfg: Self = std::fs::read(caminho::<C>())
+        let cfg: Self = std::fs::read(caminho::<C>())
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
+        cfg.normalizada()
+    }
+
+    /// Tira repetições, garante as colunas obrigatórias e acrescenta as colunas que não
+    /// existiam quando a configuração foi salva: no fim, com a visibilidade padrão delas.
+    fn normalizada(mut self) -> Self {
         let mut vistas = Vec::new();
-        cfg.colunas.retain(|(c, _)| {
+        self.colunas.retain(|(c, _)| {
             let nova = !vistas.contains(c);
             vistas.push(*c);
             nova
         });
-        for &(c, _) in C::PADRAO {
+        for &(c, visivel) in C::PADRAO {
             if !vistas.contains(&c) {
-                cfg.colunas.push((c, false));
+                self.colunas.push((c, visivel));
             }
         }
-        for (c, v) in cfg.colunas.iter_mut() {
+        for (c, v) in self.colunas.iter_mut() {
             if c.obrigatoria() {
                 *v = true;
             }
         }
-        cfg
+        self
     }
 
     pub fn salvar(&self) -> anyhow::Result<()> {
@@ -272,6 +286,19 @@ mod testes {
         let i = c.colunas.iter().position(|(c, _)| *c == ColunaProd::Descricao).unwrap();
         c.definir_visivel(i, false);
         assert!(c.colunas[i].1);
+    }
+
+    #[test]
+    fn colunas_novas_entram_no_fim_com_a_visibilidade_padrao() {
+        let salvo = ConfigColunas { colunas: vec![(ColunaNec::Tags, true), (ColunaNec::Material, true), (ColunaNec::Saldo, false)] };
+        let c = salvo.normalizada();
+
+        // A escolha salva é mantida.
+        assert_eq!(c.colunas[..3], [(ColunaNec::Tags, true), (ColunaNec::Material, true), (ColunaNec::Saldo, false)]);
+        let visivel = |alvo| c.colunas.iter().find(|(x, _)| *x == alvo).unwrap().1;
+        assert!(visivel(ColunaNec::SaldoAposOpsESimulacao), "padrão visível");
+        assert!(!visivel(ColunaNec::ListaOps), "padrão oculta");
+        assert_eq!(c.colunas.len(), ColunaNec::PADRAO.len());
     }
 
     #[test]
