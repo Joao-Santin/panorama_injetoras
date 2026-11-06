@@ -21,6 +21,8 @@ pub struct Necessidade {
     pub necessidade: f64,
     /// Consumo previsto pelas simulações. Fica em 0 no levantamento real das OPs.
     pub simulada: f64,
+    /// Já consumido pelos lançamentos parciais das OPs em aberto. Fica em 0 no levantamento real.
+    pub consumo_parcial: f64,
     pub estoque: f64,
     pub estoque_minimo: f64,
     pub controla_estoque: bool,
@@ -35,6 +37,10 @@ pub struct Necessidade {
 impl Necessidade {
     pub fn saldo(&self) -> f64 {
         self.estoque - self.necessidade
+    }
+    /// Estoque do eGestor menos o que os lançamentos parciais já consumiram.
+    pub fn estoque_fisico_real(&self) -> f64 {
+        self.estoque - self.consumo_parcial
     }
     /// Saldo considerando só as simulações, sem as OPs.
     pub fn saldo_apos_simulacao(&self) -> f64 {
@@ -298,6 +304,7 @@ pub fn calcular(ops: &[Op], produtos: &HashMap<i64, Produto>) -> Resultado {
                     unidade: unidade.clone(),
                     necessidade: 0.0,
                     simulada: 0.0,
+                    consumo_parcial: 0.0,
                     estoque: cad.map(|p| p.estoque).unwrap_or(0.0),
                     estoque_minimo: cad.map(|p| p.estoque_minimo).unwrap_or(0.0),
                     controla_estoque: cad.map(|p| p.controlar_estoque).unwrap_or(false),

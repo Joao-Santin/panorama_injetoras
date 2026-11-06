@@ -44,6 +44,8 @@ pub enum ColunaNec {
     NecessidadeSimulacao,
     SaldoAposSimulacao,
     SaldoAposOpsESimulacao,
+    ConsumoParcial,
+    EstoqueFisicoReal,
 }
 
 impl Coluna for ColunaNec {
@@ -54,6 +56,8 @@ impl Coluna for ColunaNec {
         (Self::Unidade, true),
         (Self::Necessidade, true),
         (Self::Estoque, true),
+        (Self::ConsumoParcial, true),
+        (Self::EstoqueFisicoReal, true),
         (Self::Saldo, true),
         (Self::NecessidadeSimulacao, true),
         (Self::SaldoAposSimulacao, true),
@@ -97,6 +101,8 @@ impl Coluna for ColunaNec {
             Self::NecessidadeSimulacao => "Necessidade em Simulação",
             Self::SaldoAposSimulacao => "Saldo após Simulação",
             Self::SaldoAposOpsESimulacao => "Saldo após OPs e Simulação",
+            Self::ConsumoParcial => "Consumo Parcial",
+            Self::EstoqueFisicoReal => "Estoque Físico Real",
         }
     }
 

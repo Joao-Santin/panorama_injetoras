@@ -1,7 +1,7 @@
 //! Interface gráfica (iced) do panorama de necessidades de materiais.
 
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     path::PathBuf,
     sync::Arc,
 };
@@ -25,6 +25,7 @@ use crate::{
     estrutura::{self, Estrutura, MaterialSomado, No, TipoNo},
     fmt,
     modelo::{ItemComposicao, ItemOp, Op, Produto},
+    parcial::{self, Lancamento},
     simulacao::{self, Simulacao, Simulado},
 };
 
@@ -189,6 +190,7 @@ pub enum Message {
     SoOpsComFalta(bool),
     SelOp(i64),
     VerOp(i64),
+    Realizado(parcial::Chave, String),
     FiltroGrav(FiltroGrav),
     BuscaProd(String),
     SoUsados(bool),
@@ -250,6 +252,9 @@ pub struct App {
     busca_op: String,
     so_ops_falta: bool,
     op_sel: Option<i64>,
+    lancamentos: Vec<Lancamento>,
+    /// Texto dos campos de realizado, como foi digitado (pode estar incompleto ou inválido).
+    textos_realizado: HashMap<parcial::Chave, String>,
     filtro_grav: FiltroGrav,
     busca_prod: String,
     so_usados: bool,
@@ -286,6 +291,7 @@ impl App {
     fn boot() -> (Self, Task<Message>) {
         let cache = coleta::carregar_cache();
         let sem_cache = cache.is_none();
+        let lancamentos = parcial::carregar();
         let mut app = Self {
             analise: cache.as_ref().map(Analise::de),
             coletando: sem_cache.then(|| Progresso { etapa: "Iniciando...".into(), fracao: 0.0 }),
@@ -313,6 +319,8 @@ impl App {
             busca_op: String::new(),
             so_ops_falta: false,
             op_sel: None,
+            textos_realizado: parcial::textos(&lancamentos),
+            lancamentos,
             filtro_grav: FiltroGrav::Todas,
             busca_prod: String::new(),
             so_usados: false,
@@ -352,10 +360,17 @@ impl App {
             Message::Coleta(Evento::Fim(Ok(b))) => {
                 self.coletando = None;
                 let a = Analise::de(&b);
-                self.status = Some((
-                    false,
-                    format!("Dados atualizados: {} OPs em aberto, {} produtos.", a.ops.len(), a.produtos.len()),
-                ));
+                let mut resumo = format!("Dados atualizados: {} OPs em aberto, {} produtos.", a.ops.len(), a.produtos.len());
+                // O lançamento parcial só vale enquanto a OP está aberta.
+                let descartados = parcial::manter_validos(&mut self.lancamentos, &a.ops);
+                self.textos_realizado = parcial::textos(&self.lancamentos);
+                if descartados > 0 {
+                    resumo.push_str(&format!(" {descartados} lançamento(s) parcial(is) descartado(s): a OP não está mais aberta ou o item mudou."));
+                }
+                self.status = Some((false, resumo));
+                if descartados > 0 {
+                    self.salvar_lancamentos();
+                }
                 if self.op_sel.is_some_and(|c| !a.ops.iter().any(|o| o.codigo == c)) {
                     self.op_sel = None;
                 }
@@ -495,6 +510,14 @@ impl App {
                 self.op_sel = Some(c);
                 self.aba = Aba::Ops;
             }
+            Message::Realizado(chave, s) => {
+                let mudou = parcial::definir(&mut self.lancamentos, chave, fmt::ler_qtd(&s));
+                self.textos_realizado.insert(chave, s);
+                if mudou {
+                    self.recalcular_simulacoes();
+                    self.salvar_lancamentos();
+                }
+            }
             Message::FiltroGrav(f) => self.filtro_grav = f,
             Message::BuscaProd(s) => {
                 self.busca_prod = s;
@@ -567,12 +590,23 @@ impl App {
         self.recalcular_simulacoes();
     }
 
-    /// Refaz as linhas da aba Necessidades: mudou o grupo, os dados ou as simulações.
+    /// Refaz as linhas da aba Necessidades: mudou o grupo, os dados, as simulações ou os lançamentos.
     fn recalcular_simulacoes(&mut self) {
         self.simulado = match &self.analise {
-            Some(a) => simulacao::calcular(a, &self.res_necessidades(a).necessidades, &self.simulacoes),
+            Some(a) => {
+                let mut s = simulacao::calcular(a, &self.res_necessidades(a).necessidades, &self.simulacoes);
+                // Sempre de todas as OPs abertas, mesmo com grupo: o material já saiu do estoque físico.
+                parcial::aplicar(&mut s.linhas, &parcial::consumos(&a.ops, &self.lancamentos));
+                s
+            }
             None => Simulado::default(),
         };
+    }
+
+    fn salvar_lancamentos(&mut self) {
+        if let Err(e) = parcial::salvar(&self.lancamentos) {
+            self.status = Some((true, format!("Não consegui salvar os lançamentos parciais: {e:#}")));
+        }
     }
 
     fn simulacoes_alteradas(&mut self) {
@@ -1139,10 +1173,19 @@ impl App {
             column![
                 text(n.descricao.as_str()).size(16).font(NEGRITO),
                 text(format!(
-                    "Necessidade {} {}  ·  estoque {}  ·  saldo {}  ·  {} OPs  ·  {} produtos{}",
+                    "Necessidade {} {}  ·  estoque {}{}  ·  saldo {}  ·  {} OPs  ·  {} produtos{}",
                     fmt::qtd(n.necessidade),
                     n.unidade,
                     fmt::qtd(n.estoque),
+                    if n.consumo_parcial > 0.0 {
+                        format!(
+                            "  ·  consumo parcial {}  ·  estoque físico real {}",
+                            fmt::qtd(n.consumo_parcial),
+                            fmt::qtd(n.estoque_fisico_real())
+                        )
+                    } else {
+                        String::new()
+                    },
                     fmt::qtd(n.saldo()),
                     n.ops.len(),
                     n.produtos.len(),
@@ -1325,13 +1368,45 @@ impl App {
         for al in a.res.alertas.iter().filter(|x| x.op == Some(o.codigo)) {
             col = col.push(linha_alerta(al));
         }
-        for item in &o.itens {
-            col = col.push(self.view_item_op(a, item));
+        for (linha, item) in o.itens.iter().enumerate() {
+            col = col.push(self.view_item_op(a, (o.codigo, linha, item.cod_produto), item));
         }
         scrollable(col.padding([0, 12])).height(Fill).into()
     }
 
-    fn view_item_op<'a>(&'a self, a: &'a Analise, item: &'a ItemOp) -> Element<'a, Message> {
+    /// Campo do realizado parcial de uma linha da OP, com o aviso sobre o valor digitado.
+    fn view_realizado<'a>(&'a self, chave: parcial::Chave, quant: f64) -> Element<'a, Message> {
+        let digitado = self.textos_realizado.get(&chave).map_or("", String::as_str);
+        let aviso = match fmt::ler_qtd(digitado) {
+            Some(r) if r > quant => Some((
+                format!("{} pç acima da quantidade da OP; o consumo parcial usa o valor digitado.", fmt::qtd(r - quant)),
+                text::warning as EstiloTexto,
+            )),
+            Some(r) => Some((format!("faltam {} pç", fmt::qtd(quant - r)), text::secondary as EstiloTexto)),
+            None if digitado.trim().is_empty() => None,
+            None => Some((
+                "Quantidade inválida, não considerada: informe um número maior que zero ou deixe vazio.".to_string(),
+                text::danger as EstiloTexto,
+            )),
+        };
+        let mut linha = row![
+            text("Realizado parcial").size(12),
+            text_input("0", digitado)
+                .on_input(move |s| Message::Realizado(chave, s))
+                .size(12)
+                .padding([4, 8])
+                .width(110),
+            text(format!("de {} pç", fmt::qtd(quant))).size(12).style(text::secondary),
+        ]
+        .spacing(8)
+        .align_y(Center);
+        if let Some((msg, estilo)) = aviso {
+            linha = linha.push(text(msg).size(12).style(estilo));
+        }
+        linha.into()
+    }
+
+    fn view_item_op<'a>(&'a self, a: &'a Analise, chave: parcial::Chave, item: &'a ItemOp) -> Element<'a, Message> {
         let estoque_prod = a.produtos.get(&item.cod_produto).map(|p| p.estoque).unwrap_or(0.0);
         let nec: std::collections::HashMap<i64, &'a Necessidade> =
             a.res.necessidades.iter().map(|n| (n.cod_insumo, n)).collect();
@@ -1383,11 +1458,14 @@ impl App {
         ]
         .align_y(Center);
 
-        container(column![titulo, table::table(colunas, linhas).padding_x(8).padding_y(3).width(Fill)].spacing(8))
-            .padding(12)
-            .style(container::bordered_box)
-            .width(Fill)
-            .into()
+        container(
+            column![titulo, self.view_realizado(chave, quant), table::table(colunas, linhas).padding_x(8).padding_y(3).width(Fill)]
+                .spacing(8),
+        )
+        .padding(12)
+        .style(container::bordered_box)
+        .width(Fill)
+        .into()
     }
 
     // -------------------------------------------------------- Alertas ---
@@ -1906,6 +1984,13 @@ fn coluna_necessidade<'a>(c: ColunaNec, sel: Option<i64>) -> table::Column<'a, '
         ColunaNec::Necessidade => col_num(titulo, 2, |n: N<'a>| cel(fmt::qtd(n.necessidade))),
         ColunaNec::Estoque => col_num(titulo, 2, |n: N<'a>| {
             cel(fmt::qtd(n.estoque)).style(if n.estoque < 0.0 { text::danger } else { text::base })
+        }),
+        ColunaNec::ConsumoParcial => col_num(titulo, 2, |n: N<'a>| {
+            if n.consumo_parcial > 0.0 { cel(fmt::qtd(n.consumo_parcial)) } else { cel("—").style(text::secondary) }
+        }),
+        ColunaNec::EstoqueFisicoReal => col_num(titulo, 2, |n: N<'a>| {
+            let real = n.estoque_fisico_real();
+            cel(fmt::qtd(real)).style(if real < 0.0 { text::danger } else { text::base })
         }),
         ColunaNec::EstoqueMinimo => col_num(titulo, 2, |n: N<'a>| cel(fmt::qtd(n.estoque_minimo))),
         ColunaNec::Saldo => col_num(titulo, 2, |n: N<'a>| celula_saldo(n.saldo())),

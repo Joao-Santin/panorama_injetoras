@@ -18,6 +18,7 @@ mod estrutura;
 mod fmt;
 mod gui;
 mod modelo;
+mod parcial;
 mod relatorio;
 mod simulacao;
 

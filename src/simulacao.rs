@@ -169,6 +169,7 @@ fn linha_nova(a: &Analise, item: &ItemComposicao) -> Necessidade {
         unidade: cad.map_or_else(|| item.unidade.clone(), |p| p.unidade.clone()),
         necessidade: 0.0,
         simulada: 0.0,
+        consumo_parcial: 0.0,
         estoque: cad.map_or(0.0, |p| p.estoque),
         estoque_minimo: cad.map_or(0.0, |p| p.estoque_minimo),
         controla_estoque: cad.is_some_and(|p| p.controlar_estoque),
