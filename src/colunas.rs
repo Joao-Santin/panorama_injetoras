@@ -126,6 +126,8 @@ pub enum ColunaProd {
     PrecoCusto,
     PrecoVenda,
     Tags,
+    ProduzidoParcial,
+    EstoqueReal,
 }
 
 impl Coluna for ColunaProd {
@@ -137,6 +139,8 @@ impl Coluna for ColunaProd {
         (Self::Composicao, true),
         (Self::Unidade, true),
         (Self::Estoque, true),
+        (Self::ProduzidoParcial, true),
+        (Self::EstoqueReal, true),
         (Self::EstoqueMinimo, true),
         (Self::PesoLiquido, true),
         (Self::PrecoCusto, true),
@@ -159,6 +163,8 @@ impl Coluna for ColunaProd {
             Self::PrecoCusto => "Preço custo",
             Self::PrecoVenda => "Preço venda",
             Self::Tags => "Tags",
+            Self::ProduzidoParcial => "Produzido Parcial",
+            Self::EstoqueReal => "Estoque real",
         }
     }
 

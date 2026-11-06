@@ -92,6 +92,18 @@ pub fn consumos(ops: &[Op], lancamentos: &[Lancamento]) -> HashMap<i64, f64> {
     total
 }
 
+/// Total já produzido de cada produto, somando as linhas de `ops` (as OPs em aberto).
+pub fn produzidos(ops: &[Op], lancamentos: &[Lancamento]) -> HashMap<i64, f64> {
+    let realizado: HashMap<Chave, f64> = lancamentos.iter().map(|l| (l.chave(), l.realizado)).collect();
+    let mut total = HashMap::new();
+    for (chave, item) in linhas_abertas(ops) {
+        if let Some(r) = realizado.get(&chave) {
+            *total.entry(item.cod_produto).or_insert(0.0) += r;
+        }
+    }
+    total
+}
+
 /// Preenche o consumo parcial das linhas da aba Necessidades.
 pub fn aplicar(linhas: &mut [Necessidade], consumos: &HashMap<i64, f64>) {
     for n in linhas {
@@ -150,6 +162,21 @@ mod testes {
 
         perto(c[&54], 0.4);
         assert!(!c.contains_key(&49), "a linha 0 não teve lançamento");
+    }
+
+    #[test]
+    fn produzido_soma_as_linhas_e_as_ops_do_mesmo_produto() {
+        let ops = [op(1, &[(10, 100.0, &[]), (10, 100.0, &[]), (11, 100.0, &[])]), op(2, &[(10, 100.0, &[])])];
+        let p = produzidos(&ops, &[lanc(1, 0, 10, 5.0), lanc(1, 1, 10, 2.5), lanc(2, 0, 10, 1.0), lanc(1, 2, 11, 4.0)]);
+
+        perto(p[&10], 8.5);
+        perto(p[&11], 4.0);
+    }
+
+    #[test]
+    fn produzido_ignora_op_fechada_e_linha_que_mudou_de_produto() {
+        let ops = [op(1, &[(10, 100.0, &[])])];
+        assert!(produzidos(&ops, &[lanc(2, 0, 10, 5.0), lanc(1, 0, 77, 5.0)]).is_empty());
     }
 
     #[test]

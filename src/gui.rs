@@ -34,6 +34,8 @@ const ITENS_POR_PAGINA: usize = 300;
 const ID_LISTA_PRODUTOS: &str = "lista_produtos";
 const QTD_PECAS_PADRAO: &str = "1";
 const MAX_RESULTADOS_BUSCA_SIM: usize = 8;
+/// Folga à direita das listas roláveis, para a barra de rolagem não cobrir a última coluna.
+const FOLGA_ROLAGEM: f32 = 16.0;
 const AVISO_SEM_COMPOSICOES: &str =
     "Composições e categorias ainda não coletadas: clique em \"Atualizar do eGestor\" para buscá-las.";
 
@@ -255,6 +257,8 @@ pub struct App {
     lancamentos: Vec<Lancamento>,
     /// Texto dos campos de realizado, como foi digitado (pode estar incompleto ou inválido).
     textos_realizado: HashMap<parcial::Chave, String>,
+    /// Total lançado de cada produto, para a aba Produtos.
+    produzido_parcial: HashMap<i64, f64>,
     filtro_grav: FiltroGrav,
     busca_prod: String,
     so_usados: bool,
@@ -320,6 +324,7 @@ impl App {
             so_ops_falta: false,
             op_sel: None,
             textos_realizado: parcial::textos(&lancamentos),
+            produzido_parcial: HashMap::new(),
             lancamentos,
             filtro_grav: FiltroGrav::Todas,
             busca_prod: String::new(),
@@ -592,6 +597,8 @@ impl App {
 
     /// Refaz as linhas da aba Necessidades: mudou o grupo, os dados, as simulações ou os lançamentos.
     fn recalcular_simulacoes(&mut self) {
+        self.produzido_parcial =
+            self.analise.as_ref().map(|a| parcial::produzidos(&a.ops, &self.lancamentos)).unwrap_or_default();
         self.simulado = match &self.analise {
             Some(a) => {
                 let mut s = simulacao::calcular(a, &self.res_necessidades(a).necessidades, &self.simulacoes);
@@ -910,8 +917,17 @@ impl App {
         .align_y(Center);
 
         let sel = self.material_sel;
-        let colunas: Vec<_> = self.config_nec.visiveis().map(|c| coluna_necessidade(c, sel)).collect();
-        let tabela = rolagem(table::table(colunas, linhas).padding_x(8).padding_y(4).width(Fill));
+        // O cabeçalho é uma tabela à parte, fora da rolagem, para não descer com a lista. As colunas
+        // são todas proporcionais: com a mesma largura disponível, as duas tabelas ficam alinhadas.
+        let titulos: Vec<_> = self.config_nec.visiveis().map(|c| coluna_necessidade(c, sel, cab(c.rotulo()).into())).collect();
+        let sem_linhas: [&'a Necessidade; 0] = [];
+        let cabecalho = container(table::table(titulos, sem_linhas).padding_x(8).padding_y(4).width(Fill))
+            .padding(iced::Padding { right: FOLGA_ROLAGEM, ..iced::Padding::ZERO })
+            .width(Fill)
+            .style(container::rounded_box);
+        let colunas: Vec<_> = self.config_nec.visiveis().map(|c| coluna_necessidade(c, sel, space().into())).collect();
+        let lista = rolagem(table::table(colunas, linhas).padding_x(8).padding_y(4).width(Fill)).height(Fill);
+        let tabela = column![cabecalho, lista].width(Fill);
         // Em modo de configuração, o painel fica à direita da tabela (prévia ao vivo).
         let tabela: Element<'a, Message> = if self.modo_config_nec {
             row![container(tabela).width(Fill), view_config_colunas(&self.config_nec, Tabela::Necessidades)].spacing(12).into()
@@ -1523,7 +1539,7 @@ impl App {
         .align_y(Center);
 
         let sel = self.produto_sel;
-        let colunas: Vec<_> = self.config_prod.visiveis().map(|c| coluna_produto(c, a, sel)).collect();
+        let colunas: Vec<_> = self.config_prod.visiveis().map(|c| coluna_produto(c, a, sel, &self.produzido_parcial)).collect();
         let mut lista = column![].spacing(8);
         if pag.ultima > 0 {
             lista = lista.push(view_paginacao(pag));
@@ -1659,9 +1675,15 @@ fn view_paginacao<'a>(p: Paginacao) -> Element<'a, Message> {
 }
 
 /// Monta uma coluna da tabela de Produtos.
-fn coluna_produto<'a>(c: ColunaProd, a: &'a Analise, sel: Option<i64>) -> table::Column<'a, 'a, &'a Produto, Message> {
+fn coluna_produto<'a>(
+    c: ColunaProd,
+    a: &'a Analise,
+    sel: Option<i64>,
+    produzido: &'a HashMap<i64, f64>,
+) -> table::Column<'a, 'a, &'a Produto, Message> {
     type P<'x> = &'x Produto;
     let titulo = c.rotulo();
+    let produzido_de = move |p: P<'a>| produzido.get(&p.codigo).copied().unwrap_or(0.0);
     match c {
         ColunaProd::Codigo => col_num(titulo, 1, |p: P<'a>| cel(p.codigo.to_string())),
         ColunaProd::CodigoProprio => table::column(cab(titulo), |p: P<'a>| cel(p.codigo_proprio.as_str())).width(FillPortion(2)),
@@ -1682,6 +1704,14 @@ fn coluna_produto<'a>(c: ColunaProd, a: &'a Analise, sel: Option<i64>) -> table:
         ColunaProd::Unidade => table::column(cab(titulo), |p: P<'a>| cel(p.unidade.as_str())).width(FillPortion(1)),
         ColunaProd::Estoque => col_num(titulo, 2, |p: P<'a>| {
             cel(fmt::qtd(p.estoque)).style(if p.estoque < 0.0 { text::danger } else { text::base })
+        }),
+        ColunaProd::ProduzidoParcial => col_num(titulo, 2, move |p: P<'a>| match produzido_de(p) {
+            v if v > 0.0 => cel(fmt::qtd(v)),
+            _ => cel("—").style(text::secondary),
+        }),
+        ColunaProd::EstoqueReal => col_num(titulo, 2, move |p: P<'a>| {
+            let real = p.estoque + produzido_de(p);
+            cel(fmt::qtd(real)).style(if real < 0.0 { text::danger } else { text::base })
         }),
         ColunaProd::EstoqueMinimo => col_num(titulo, 2, |p: P<'a>| cel(fmt::qtd(p.estoque_minimo))),
         ColunaProd::PesoLiquido => col_num(titulo, 2, |p: P<'a>| cel(fmt::num(p.peso_liquido, 4))),
@@ -1968,55 +1998,58 @@ fn celula_saldo<'a>(saldo: f64) -> iced::widget::Text<'a> {
 }
 
 /// Monta uma coluna da tabela de Necessidades.
-fn coluna_necessidade<'a>(c: ColunaNec, sel: Option<i64>) -> table::Column<'a, 'a, &'a Necessidade, Message> {
+fn coluna_necessidade<'a>(
+    c: ColunaNec,
+    sel: Option<i64>,
+    cabecalho: Element<'a, Message>,
+) -> table::Column<'a, 'a, &'a Necessidade, Message> {
     type N<'x> = &'x Necessidade;
-    let titulo = c.rotulo();
     match c {
-        ColunaNec::Material => table::column(cab(titulo), move |n: N<'a>| {
+        ColunaNec::Material => table::column(cabecalho, move |n: N<'a>| {
             let estilo: EstiloBotao = if sel == Some(n.cod_insumo) { button::primary } else { button::text };
             button(text(n.descricao.as_str()).size(13)).padding([1, 4]).style(estilo).on_press(Message::SelMaterial(n.cod_insumo))
         })
         .width(FillPortion(6)),
-        ColunaNec::Codigo => col_num(titulo, 1, |n: N<'a>| cel(n.cod_insumo.to_string())),
-        ColunaNec::CodigoProprio => table::column(cab(titulo), |n: N<'a>| cel(n.codigo_proprio.as_str())).width(FillPortion(2)),
-        ColunaNec::Categoria => table::column(cab(titulo), |n: N<'a>| cel(n.categoria.as_str())).width(FillPortion(2)),
-        ColunaNec::Unidade => table::column(cab(titulo), |n: N<'a>| cel(n.unidade.as_str())).width(FillPortion(1)),
-        ColunaNec::Necessidade => col_num(titulo, 2, |n: N<'a>| cel(fmt::qtd(n.necessidade))),
-        ColunaNec::Estoque => col_num(titulo, 2, |n: N<'a>| {
+        ColunaNec::Codigo => col_num_com(cabecalho, 1, |n: N<'a>| cel(n.cod_insumo.to_string())),
+        ColunaNec::CodigoProprio => table::column(cabecalho, |n: N<'a>| cel(n.codigo_proprio.as_str())).width(FillPortion(2)),
+        ColunaNec::Categoria => table::column(cabecalho, |n: N<'a>| cel(n.categoria.as_str())).width(FillPortion(2)),
+        ColunaNec::Unidade => table::column(cabecalho, |n: N<'a>| cel(n.unidade.as_str())).width(FillPortion(1)),
+        ColunaNec::Necessidade => col_num_com(cabecalho, 2, |n: N<'a>| cel(fmt::qtd(n.necessidade))),
+        ColunaNec::Estoque => col_num_com(cabecalho, 2, |n: N<'a>| {
             cel(fmt::qtd(n.estoque)).style(if n.estoque < 0.0 { text::danger } else { text::base })
         }),
-        ColunaNec::ConsumoParcial => col_num(titulo, 2, |n: N<'a>| {
+        ColunaNec::ConsumoParcial => col_num_com(cabecalho, 2, |n: N<'a>| {
             if n.consumo_parcial > 0.0 { cel(fmt::qtd(n.consumo_parcial)) } else { cel("—").style(text::secondary) }
         }),
-        ColunaNec::EstoqueFisicoReal => col_num(titulo, 2, |n: N<'a>| {
+        ColunaNec::EstoqueFisicoReal => col_num_com(cabecalho, 2, |n: N<'a>| {
             let real = n.estoque_fisico_real();
             cel(fmt::qtd(real)).style(if real < 0.0 { text::danger } else { text::base })
         }),
-        ColunaNec::EstoqueMinimo => col_num(titulo, 2, |n: N<'a>| cel(fmt::qtd(n.estoque_minimo))),
-        ColunaNec::Saldo => col_num(titulo, 2, |n: N<'a>| celula_saldo(n.saldo())),
-        ColunaNec::NecessidadeSimulacao => col_num(titulo, 2, |n: N<'a>| {
+        ColunaNec::EstoqueMinimo => col_num_com(cabecalho, 2, |n: N<'a>| cel(fmt::qtd(n.estoque_minimo))),
+        ColunaNec::Saldo => col_num_com(cabecalho, 2, |n: N<'a>| celula_saldo(n.saldo())),
+        ColunaNec::NecessidadeSimulacao => col_num_com(cabecalho, 2, |n: N<'a>| {
             if n.simulada > 0.0 { cel(fmt::qtd(n.simulada)) } else { cel("—").style(text::secondary) }
         }),
-        ColunaNec::SaldoAposSimulacao => col_num(titulo, 2, |n: N<'a>| celula_saldo(n.saldo_apos_simulacao())),
-        ColunaNec::SaldoAposOpsESimulacao => col_num(titulo, 2, |n: N<'a>| celula_saldo(n.saldo_apos_ops_e_simulacao())),
-        ColunaNec::Falta => col_num(titulo, 2, |n: N<'a>| {
+        ColunaNec::SaldoAposSimulacao => col_num_com(cabecalho, 2, |n: N<'a>| celula_saldo(n.saldo_apos_simulacao())),
+        ColunaNec::SaldoAposOpsESimulacao => col_num_com(cabecalho, 2, |n: N<'a>| celula_saldo(n.saldo_apos_ops_e_simulacao())),
+        ColunaNec::Falta => col_num_com(cabecalho, 2, |n: N<'a>| {
             let e: EstiloTexto = if n.falta() > 0.0 { text::danger } else { text::secondary };
             cel(if n.falta() > 0.0 { fmt::qtd(n.falta()) } else { "—".into() }).style(e).font(NEGRITO)
         }),
-        ColunaNec::ComprarComMinimo => col_num(titulo, 2, |n: N<'a>| cel(fmt::qtd(n.comprar_com_minimo()))),
-        ColunaNec::CustoUnit => col_num(titulo, 2, |n: N<'a>| cel(fmt::moeda(n.custo_unit))),
-        ColunaNec::CustoNecessidade => col_num(titulo, 2, |n: N<'a>| cel(fmt::moeda(n.custo_necessidade()))),
-        ColunaNec::CustoFalta => col_num(titulo, 2, |n: N<'a>| cel(fmt::moeda(n.custo_falta()))),
+        ColunaNec::ComprarComMinimo => col_num_com(cabecalho, 2, |n: N<'a>| cel(fmt::qtd(n.comprar_com_minimo()))),
+        ColunaNec::CustoUnit => col_num_com(cabecalho, 2, |n: N<'a>| cel(fmt::moeda(n.custo_unit))),
+        ColunaNec::CustoNecessidade => col_num_com(cabecalho, 2, |n: N<'a>| cel(fmt::moeda(n.custo_necessidade()))),
+        ColunaNec::CustoFalta => col_num_com(cabecalho, 2, |n: N<'a>| cel(fmt::moeda(n.custo_falta()))),
         ColunaNec::ControlaEstoque => {
-            table::column(cab(titulo), |n: N<'a>| cel(if n.controla_estoque { "Sim" } else { "Não" })).width(FillPortion(1))
+            table::column(cabecalho, |n: N<'a>| cel(if n.controla_estoque { "Sim" } else { "Não" })).width(FillPortion(1))
         }
-        ColunaNec::NumOps => col_num(titulo, 1, |n: N<'a>| cel(n.ops.len().to_string())),
-        ColunaNec::ListaOps => table::column(cab(titulo), |n: N<'a>| {
+        ColunaNec::NumOps => col_num_com(cabecalho, 1, |n: N<'a>| cel(n.ops.len().to_string())),
+        ColunaNec::ListaOps => table::column(cabecalho, |n: N<'a>| {
             cel(n.ops.iter().map(|o| o.to_string()).collect::<Vec<_>>().join(", "))
         })
         .width(FillPortion(3)),
-        ColunaNec::NumProdutos => col_num(titulo, 1, |n: N<'a>| cel(n.produtos.len().to_string())),
-        ColunaNec::Tags => table::column(cab(titulo), |n: N<'a>| -> Element<'a, Message> {
+        ColunaNec::NumProdutos => col_num_com(cabecalho, 1, |n: N<'a>| cel(n.produtos.len().to_string())),
+        ColunaNec::Tags => table::column(cabecalho, |n: N<'a>| -> Element<'a, Message> {
             if n.tags.is_empty() {
                 cel("—").style(text::secondary).into()
             } else {
@@ -2045,7 +2078,15 @@ fn col_num<'a, 'b, T: 'a, E: Into<Element<'a, Message>>>(
     peso: u16,
     f: impl Fn(T) -> E + 'b,
 ) -> table::Column<'a, 'b, T, Message> {
-    table::column(cab(titulo), f).width(FillPortion(peso)).align_x(Right)
+    col_num_com(cab(titulo).into(), peso, f)
+}
+
+fn col_num_com<'a, 'b, T: 'a, E: Into<Element<'a, Message>>>(
+    cabecalho: Element<'a, Message>,
+    peso: u16,
+    f: impl Fn(T) -> E + 'b,
+) -> table::Column<'a, 'b, T, Message> {
+    table::column(cabecalho, f).width(FillPortion(peso)).align_x(Right)
 }
 
 fn card<'a>(rotulo: &'a str, valor: String, detalhe: String, estilo: EstiloTexto) -> Element<'a, Message> {
@@ -2133,7 +2174,7 @@ fn linha_alerta<'a>(al: &'a Alerta) -> Element<'a, Message> {
 
 /// Área rolável com folga à direita, para a barra de rolagem não cobrir a última coluna.
 fn rolagem<'a>(conteudo: impl Into<Element<'a, Message>>) -> iced::widget::Scrollable<'a, Message> {
-    scrollable(container(conteudo).padding(iced::Padding { right: 16.0, ..iced::Padding::ZERO }))
+    scrollable(container(conteudo).padding(iced::Padding { right: FOLGA_ROLAGEM, ..iced::Padding::ZERO }))
 }
 
 #[cfg(test)]
