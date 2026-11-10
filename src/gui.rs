@@ -27,6 +27,7 @@ use crate::{
     modelo::{ItemComposicao, ItemOp, Op, Produto},
     parcial::{self, Lancamento},
     simulacao::{self, Simulacao, Simulado},
+    trello::{self, Etapa, Situacao, Situacoes},
 };
 
 const NEGRITO: Font = Font { weight: font::Weight::Bold, ..Font::DEFAULT };
@@ -108,6 +109,28 @@ impl std::fmt::Display for OrdemNec {
     }
 }
 
+/// Ordem da lista da aba OPs em aberto.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrdemOp {
+    Numero,
+    Maquina,
+    Situacao,
+}
+
+impl OrdemOp {
+    const TODAS: [OrdemOp; 3] = [Self::Numero, Self::Maquina, Self::Situacao];
+}
+
+impl std::fmt::Display for OrdemOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Numero => "Ordenar: nº da OP (mais nova primeiro)",
+            Self::Maquina => "Ordenar: máquina que está produzindo",
+            Self::Situacao => "Ordenar: aguardando máquina → em máquina → aguardando baixa",
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FiltroGrav {
     Todas,
@@ -161,6 +184,8 @@ pub enum Evento {
 #[derive(Debug, Clone)]
 pub enum Message {
     Atualizar,
+    AtualizarTrello,
+    Trello(Result<Arc<Situacoes>, String>),
     Coleta(Evento),
     Exportar,
     AbrirArquivo(PathBuf),
@@ -190,6 +215,7 @@ pub enum Message {
     VerMaterial(i64),
     BuscaOp(String),
     SoOpsComFalta(bool),
+    OrdemOp(OrdemOp),
     SelOp(i64),
     VerOp(i64),
     Realizado(parcial::Chave, String),
@@ -253,6 +279,12 @@ pub struct App {
     material_sel: Option<i64>,
     busca_op: String,
     so_ops_falta: bool,
+    ordem_op: OrdemOp,
+    /// Última situação lida do Trello (fica a anterior se uma nova busca falhar).
+    trello: Arc<Situacoes>,
+    buscando_trello: bool,
+    /// Hora da última busca certa, ou o erro da última tentativa.
+    status_trello: Option<Result<String, String>>,
     op_sel: Option<i64>,
     lancamentos: Vec<Lancamento>,
     /// Texto dos campos de realizado, como foi digitado (pode estar incompleto ou inválido).
@@ -275,7 +307,7 @@ fn iniciar_coleta() -> Task<Message> {
     let (tx, rx) = futures::channel::mpsc::unbounded();
     std::thread::spawn(move || {
         let tx_prog = tx.clone();
-        let r = coleta::coletar(&coleta::url_api(), &mut |p| {
+        let r = coleta::coletar(&crate::api::url_servidor(), &mut |p| {
             let _ = tx_prog.unbounded_send(Evento::Progresso(p));
         })
         .and_then(|b| {
@@ -285,6 +317,15 @@ fn iniciar_coleta() -> Task<Message> {
         let _ = tx.unbounded_send(Evento::Fim(r.map(Arc::new).map_err(|e| format!("{e:#}"))));
     });
     Task::run(rx, Message::Coleta)
+}
+
+/// Busca a situação das OPs no Trello numa thread, sem travar a interface.
+fn iniciar_trello() -> Task<Message> {
+    let (tx, rx) = futures::channel::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(trello::buscar(&crate::api::url_servidor()).map(Arc::new).map_err(|e| format!("{e:#}")));
+    });
+    Task::perform(rx, |r| Message::Trello(r.unwrap_or_else(|_| Err("a busca no Trello foi interrompida".into()))))
 }
 
 fn contem(alvo: &str, busca: &str) -> bool {
@@ -302,7 +343,7 @@ impl App {
             status: (!sem_cache)
                 .then(|| (false, "Dados carregados do cache local. Clique em \"Atualizar do eGestor\" para buscar os atuais.".into())),
             ultimo_excel: None,
-            escuro: false,
+            escuro: true,
             aba: Aba::Resumo,
             busca_nec: String::new(),
             so_faltas: false,
@@ -322,6 +363,10 @@ impl App {
             material_sel: None,
             busca_op: String::new(),
             so_ops_falta: false,
+            ordem_op: OrdemOp::Numero,
+            trello: Arc::default(),
+            buscando_trello: true,
+            status_trello: None,
             op_sel: None,
             textos_realizado: parcial::textos(&lancamentos),
             produzido_parcial: HashMap::new(),
@@ -337,8 +382,8 @@ impl App {
             qtd_pecas: QTD_PECAS_PADRAO.into(),
         };
         app.recalcular_simulacoes();
-        let task = if sem_cache { iniciar_coleta() } else { Task::none() };
-        (app, task)
+        let coleta = if sem_cache { iniciar_coleta() } else { Task::none() };
+        (app, Task::batch([coleta, iniciar_trello()]))
     }
 
     fn titulo(&self) -> String {
@@ -358,8 +403,19 @@ impl App {
                 if self.coletando.is_none() {
                     self.coletando = Some(Progresso { etapa: "Iniciando...".into(), fracao: 0.0 });
                     self.status = None;
-                    return iniciar_coleta();
+                    return Task::batch([iniciar_coleta(), self.atualizar_trello()]);
                 }
+            }
+            Message::AtualizarTrello => return self.atualizar_trello(),
+            Message::Trello(r) => {
+                self.buscando_trello = false;
+                self.status_trello = Some(match r {
+                    Ok(s) => {
+                        self.trello = s;
+                        Ok(chrono::Local::now().format("%H:%M").to_string())
+                    }
+                    Err(e) => Err(e),
+                });
             }
             Message::Coleta(Evento::Progresso(p)) => self.coletando = Some(p),
             Message::Coleta(Evento::Fim(Ok(b))) => {
@@ -510,6 +566,7 @@ impl App {
             }
             Message::BuscaOp(s) => self.busca_op = s,
             Message::SoOpsComFalta(b) => self.so_ops_falta = b,
+            Message::OrdemOp(o) => self.ordem_op = o,
             Message::SelOp(c) => self.op_sel = Some(c),
             Message::VerOp(c) => {
                 self.op_sel = Some(c);
@@ -550,6 +607,19 @@ impl App {
             Message::QtdPecas(s) => self.qtd_pecas = s,
         }
         Task::none()
+    }
+
+    fn atualizar_trello(&mut self) -> Task<Message> {
+        if self.buscando_trello {
+            return Task::none();
+        }
+        self.buscando_trello = true;
+        iniciar_trello()
+    }
+
+    /// Situações da OP no Trello (vazio = sem cartão nas 3 listas).
+    fn situacoes(&self, op: i64) -> &[Situacao] {
+        self.trello.get(&op).map_or(&[], Vec::as_slice)
     }
 
     /// Troca a página e volta a rolagem ao topo, para a nova página começar do primeiro item.
@@ -664,8 +734,8 @@ impl App {
 
     fn view_cabecalho(&self) -> Element<'_, Message> {
         let sub = match &self.analise {
-            Some(a) => format!("Dados coletados em {}  ·  gateway {}", a.gerado_em, coleta::url_api()),
-            None => format!("Sem dados  ·  gateway {}", coleta::url_api()),
+            Some(a) => format!("Dados coletados em {}  ·  servidor {}", a.gerado_em, crate::api::url_servidor()),
+            None => format!("Sem dados  ·  servidor {}", crate::api::url_servidor()),
         };
         let topo = row![
             column![
@@ -1278,19 +1348,40 @@ impl App {
     // ------------------------------------------------------------ OPs ---
 
     fn view_ops<'a>(&'a self, a: &'a Analise) -> Element<'a, Message> {
-        let busca = self.busca_op.to_lowercase();
+        // Uma situação ou máquina digitada por inteiro filtra por ela; o resto é busca de texto.
+        let filtro = trello::FiltroSituacao::da_busca(&self.busca_op);
+        let busca = trello::normalizar(&self.busca_op);
         let ops_com_falta = a.res.ops_com_falta();
+
+        // Começa do nº mais novo; as outras ordens são estáveis, então o nº desempata.
+        let mut ops: Vec<&'a Op> = a.ops.iter().rev().collect();
+        let posicao = |o: &Op| trello::posicao_por_situacao(self.situacoes(o.codigo));
+        match self.ordem_op {
+            OrdemOp::Numero => {}
+            // Dentro de "em máquina", da MAQUINA 1 à 11.
+            OrdemOp::Situacao => ops.sort_by_key(|o| (posicao(o), trello::chave_maquina(self.situacoes(o.codigo)))),
+            // Primeiro as que estão em máquina, pela máquina; depois as demais, pela situação.
+            OrdemOp::Maquina => ops.sort_by_key(|o| {
+                let maquina = trello::chave_maquina(self.situacoes(o.codigo));
+                (maquina.is_none(), maquina, posicao(o))
+            }),
+        }
 
         let mut lista = column![].spacing(6);
         let mut n = 0;
-        for o in a.ops.iter().rev() {
+        for o in ops {
             let texto_busca = format!(
-                "{} {} {}",
+                "{} {} {} {}",
                 o.codigo,
                 o.tags.join(" "),
-                o.itens.iter().map(|i| i.descricao.as_str()).collect::<Vec<_>>().join(" ")
+                o.itens.iter().map(|i| i.descricao.as_str()).collect::<Vec<_>>().join(" "),
+                self.situacoes(o.codigo).iter().map(Situacao::texto).collect::<Vec<_>>().join(" ")
             );
-            if !contem(&texto_busca, &busca) {
+            let passa = match filtro {
+                Some(f) => f.aceita(self.situacoes(o.codigo)),
+                None => trello::normalizar(&texto_busca).contains(&busca),
+            };
+            if !passa {
                 continue;
             }
             let falta = ops_com_falta.contains(&o.codigo);
@@ -1308,11 +1399,12 @@ impl App {
             lista = lista.push(
                 button(
                     column![
-                        row![
-                            text(format!("OP {}", o.codigo)).size(14).font(NEGRITO),
-                            space::horizontal(),
-                            text(format!("início {}", fmt::data(&o.dt_inicio))).size(11),
-                        ],
+                        row![text(format!("OP {}", o.codigo)).size(14).font(NEGRITO)]
+                            .extend(self.situacoes(o.codigo).iter().map(selo_trello))
+                            .push(space::horizontal())
+                            .push(text(format!("início {}", fmt::data(&o.dt_inicio))).size(11))
+                            .spacing(6)
+                            .align_y(Center),
                         text(format!("{principal}{extra}")).size(12),
                         linha2,
                     ]
@@ -1326,9 +1418,16 @@ impl App {
         }
 
         let esquerda = column![
-            text_input("Buscar OP, produto ou tag...", &self.busca_op).on_input(Message::BuscaOp),
+            text_input("Buscar OP, produto, tag, máquina ou situação...", &self.busca_op).on_input(Message::BuscaOp),
             toggler(self.so_ops_falta).label("Somente OPs com falta de material").on_toggle(Message::SoOpsComFalta),
-            text(format!("{n} OPs")).size(12).style(text::secondary),
+            pick_list(OrdemOp::TODAS, Some(self.ordem_op), Message::OrdemOp).text_size(13).width(Fill),
+            text(match filtro {
+                Some(f) => format!("{n} OPs  ·  filtrando: {}", f.rotulo()),
+                None => format!("{n} OPs"),
+            })
+            .size(12)
+            .style(if filtro.is_some() { text::primary } else { text::secondary }),
+            self.view_status_trello(a),
             scrollable(lista.padding([0, 12])).height(Fill),
         ]
         .spacing(8)
@@ -1342,13 +1441,52 @@ impl App {
         row![esquerda, rule::vertical(1), container(direita).width(Fill).height(Fill)].spacing(12).into()
     }
 
+    /// Linha da lista de OPs que diz de quando é a situação do Trello, com o botão de atualizar.
+    fn view_status_trello<'a>(&'a self, a: &'a Analise) -> Element<'a, Message> {
+        let com_cartao = a.ops.iter().filter(|o| self.trello.contains_key(&o.codigo)).count();
+        let (msg, estilo): (String, EstiloTexto) = match (&self.status_trello, self.buscando_trello) {
+            (None, _) => ("Trello: buscando a situação das OPs...".into(), text::secondary),
+            (Some(Ok(hora)), buscando) => (
+                format!(
+                    "Trello: {com_cartao} de {} OPs com cartão · lido às {hora}{}",
+                    a.ops.len(),
+                    if buscando { " · atualizando..." } else { "" }
+                ),
+                text::secondary,
+            ),
+            (Some(Err(e)), _) => (
+                format!(
+                    "Trello indisponível{}: {e}",
+                    if self.trello.is_empty() { "" } else { " (mostrando a última leitura)" }
+                ),
+                text::danger,
+            ),
+        };
+        row![
+            text(msg).size(11).style(estilo).width(Fill),
+            button(text(if self.buscando_trello { "Buscando..." } else { "Atualizar Trello" }).size(11))
+                .padding([2, 8])
+                .style(button::secondary)
+                .on_press_maybe((!self.buscando_trello).then_some(Message::AtualizarTrello)),
+        ]
+        .spacing(8)
+        .align_y(Center)
+        .into()
+    }
+
     fn view_detalhe_op<'a>(&'a self, a: &'a Analise, o: &'a Op) -> Element<'a, Message> {
         let no_grupo = self.grupo_ops.contains(&o.codigo);
         let estilo_grupo: EstiloBotao = if no_grupo { button::secondary } else { button::primary };
         let cab_op = column![
-            row![
-                text(format!("OP {}", o.codigo)).size(22).font(NEGRITO),
-                space::horizontal(),
+            row![text(format!("OP {}", o.codigo)).size(22).font(NEGRITO)]
+                .extend(self.situacoes(o.codigo).iter().map(selo_trello))
+                .push(if self.trello.contains_key(&o.codigo) || self.status_trello.is_none() {
+                    text("")
+                } else {
+                    text("sem cartão no Trello").size(12).style(text::secondary)
+                })
+                .push(space::horizontal())
+                .push(
                 button(
                     text(if no_grupo {
                         format!("Remover do grupo de necessidades ({} OPs)", self.grupo_ops.len())
@@ -1357,10 +1495,11 @@ impl App {
                     })
                     .size(13)
                 )
-                .style(estilo_grupo)
-                .on_press(Message::GrupoAlternar(o.codigo)),
-            ]
-            .align_y(Center),
+                    .style(estilo_grupo)
+                    .on_press(Message::GrupoAlternar(o.codigo)),
+                )
+                .spacing(10)
+                .align_y(Center),
             text(o.tags.join("  ·  ")).size(13),
             text(format!(
                 "Cadastro {}  ·  início {}  ·  entrega {}  ·  {} itens  ·  {} peças  ·  {} kg  ·  {}",
@@ -2144,6 +2283,25 @@ fn cartao_selecionado(theme: &Theme, status: button::Status) -> button::Style {
         border: iced::Border { radius: 6.0.into(), width: 2.0, color: p.primary.strong.color },
         ..cartao(theme, status)
     }
+}
+
+/// Etiqueta colorida da situação da OP no Trello: vermelho aguardando máquina,
+/// laranja em máquina e amarelo aguardando baixa. Cores fixas, iguais nos dois temas.
+fn selo_trello<'a>(s: &Situacao) -> Element<'a, Message> {
+    let (fundo, letra) = match s.etapa {
+        Etapa::AguardandoMaquina => (iced::Color::from_rgb8(0xC6, 0x28, 0x28), iced::Color::WHITE),
+        Etapa::EmMaquina => (iced::Color::from_rgb8(0xEF, 0x6C, 0x00), iced::Color::WHITE),
+        Etapa::AguardandoBaixa => (iced::Color::from_rgb8(0xF9, 0xC8, 0x0E), iced::Color::BLACK),
+    };
+    container(text(s.texto()).size(11).font(NEGRITO))
+        .padding([1, 6])
+        .style(move |_: &Theme| container::Style {
+            background: Some(fundo.into()),
+            text_color: Some(letra),
+            border: iced::Border { radius: 4.0.into(), ..iced::Border::default() },
+            ..container::Style::default()
+        })
+        .into()
 }
 
 fn estilo_gravidade(g: &str) -> EstiloTexto {

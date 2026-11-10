@@ -40,10 +40,6 @@ fn prog(etapa: impl Into<String>, fracao: f32) -> Progresso {
     Progresso { etapa: etapa.into(), fracao: fracao.clamp(0.0, 1.0) }
 }
 
-pub fn url_api() -> String {
-    std::env::var("EGESTOR_API_URL").unwrap_or_else(|_| "http://localhost:3000/api".into())
-}
-
 pub fn pasta_saida() -> PathBuf {
     PathBuf::from(std::env::var("SAIDA_DIR").unwrap_or_else(|_| "relatorios".into()))
 }
@@ -64,9 +60,10 @@ pub fn carregar_cache() -> Option<DadosBrutos> {
 }
 
 /// Busca OPs em aberto (com composição) e o cadastro completo de produtos.
-pub fn coletar(base: &str, progresso: &mut dyn FnMut(Progresso)) -> Result<DadosBrutos> {
-    let mut api = Api::new(base)?;
-    progresso(prog("Conectando ao gateway...", 0.0));
+/// `raiz` é o endereço do servidor (ex.: `http://localhost:3000`).
+pub fn coletar(raiz: &str, progresso: &mut dyn FnMut(Progresso)) -> Result<DadosBrutos> {
+    let mut api = Api::new(raiz)?;
+    progresso(prog("Conectando ao servidor...", 0.0));
     api.health()?;
 
     // Composições cadastradas e categorias: chamadas rápidas, feitas antes da parte demorada.

@@ -1,6 +1,7 @@
-//! Cliente HTTP para o gateway `egestor-rust-server` (que repassa para a API
-//! do eGestor). Faz throttling (o eGestor limita a 60 req/min), repete em
-//! caso de 429 e trata a paginação.
+//! Cliente HTTP para o servidor `biplas_server_claude`, que repassa para a API
+//! do eGestor (`/api/egestor/*`) e serve o quadro do Trello (`/api/trello/*`).
+//! Faz throttling (o eGestor limita a 60 req/min), repete em caso de 429 e
+//! trata a paginação.
 
 use std::{
     collections::HashSet,
@@ -9,39 +10,71 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use reqwest::Method;
+use reqwest::{
+    Method,
+    header::{HeaderMap, HeaderValue},
+};
 use serde_json::Value;
 
 /// Intervalo mínimo entre requisições (60 req/min no eGestor → ~1 por segundo).
 const INTERVALO_MIN: Duration = Duration::from_millis(1050);
 const MAX_TENTATIVAS: u32 = 6;
 
+/// Endereço do servidor, sem o `/api` (variável `BIPLAS_SERVER_URL`).
+pub fn url_servidor() -> String {
+    std::env::var("BIPLAS_SERVER_URL")
+        .unwrap_or_else(|_| "http://localhost:3000".into())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// Cliente HTTP que já manda o `x-api-key` quando `BIPLAS_API_KEY` está definida
+/// (o servidor exige o header em `/api/*` se tiver `API_KEY` no `.env` dele).
+pub fn cliente_http(tempo_limite: Duration) -> Result<reqwest::blocking::Client> {
+    let mut headers = HeaderMap::new();
+    if let Ok(chave) = std::env::var("BIPLAS_API_KEY") {
+        let mut valor = HeaderValue::from_str(chave.trim()).context("BIPLAS_API_KEY tem caracteres inválidos")?;
+        valor.set_sensitive(true);
+        headers.insert("x-api-key", valor);
+    }
+    Ok(reqwest::blocking::Client::builder().timeout(tempo_limite).default_headers(headers).build()?)
+}
+
+/// Verifica se o servidor está no ar e com a integração pedida (`"egestor"` ou
+/// `"trello"`) configurada, via `GET /health`.
+pub fn verificar_servidor(http: &reqwest::blocking::Client, raiz: &str, integracao: &str) -> Result<()> {
+    let resp = http
+        .get(format!("{raiz}/health"))
+        .send()
+        .with_context(|| format!("Não consegui conectar ao servidor em {raiz}. Ele está rodando?"))?;
+    if !resp.status().is_success() {
+        bail!("Servidor respondeu {} em /health", resp.status());
+    }
+    let v: Value = resp.json().context("Resposta de /health não é JSON")?;
+    if v[integracao] == Value::Bool(false) {
+        bail!("O servidor em {raiz} está sem a integração \"{integracao}\" configurada (veja o .env dele)");
+    }
+    Ok(())
+}
+
 pub struct Api {
     http: reqwest::blocking::Client,
+    raiz: String,
     base: String,
     ultima: Option<Instant>,
 }
 
 impl Api {
-    pub fn new(base: impl Into<String>) -> Result<Self> {
-        let http = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(60))
-            .build()?;
-        Ok(Self { http, base: base.into().trim_end_matches('/').to_string(), ultima: None })
+    /// `raiz` é o endereço do servidor (ex.: `http://localhost:3000`).
+    pub fn new(raiz: &str) -> Result<Self> {
+        let raiz = raiz.trim_end_matches('/').to_string();
+        let base = format!("{raiz}/api/egestor");
+        Ok(Self { http: cliente_http(Duration::from_secs(60))?, raiz, base, ultima: None })
     }
 
-    /// Verifica se o gateway está no ar (`GET /health`, fora do prefixo /api).
+    /// Verifica se o servidor está no ar e com o eGestor configurado.
     pub fn health(&self) -> Result<()> {
-        let raiz = self.base.trim_end_matches("/api");
-        let resp = self
-            .http
-            .get(format!("{raiz}/health"))
-            .send()
-            .with_context(|| format!("Não consegui conectar ao gateway em {raiz}. Ele está rodando?"))?;
-        if !resp.status().is_success() {
-            bail!("Gateway respondeu {} em /health", resp.status());
-        }
-        Ok(())
+        verificar_servidor(&self.http, &self.raiz, "egestor")
     }
 
     /// GET em `{base}{caminho}` (caminho já com query string, se houver).

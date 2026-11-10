@@ -1,14 +1,18 @@
 //! Panorama de injetados: coleta as OPs em aberto e o cadastro de produtos
-//! no eGestor (via gateway `egestor-rust-server`) e mostra o levantamento de
+//! no eGestor (via servidor `biplas_server_claude`) e mostra o levantamento de
 //! necessidades de materiais.
 //!
 //! Uso:
 //!   cargo run --release            → interface gráfica (iced)
 //!   cargo run --release -- --cli   → só coleta e gera a planilha Excel
 //!
-//! Variáveis de ambiente (opcionais):
-//!   EGESTOR_API_URL  URL do gateway (padrão: http://localhost:3000/api)
-//!   SAIDA_DIR        pasta de planilhas/cache (padrão: ./relatorios)
+//! Variáveis de ambiente (opcionais; também lidas do `.env`, veja `.env.example`):
+//!   BIPLAS_SERVER_URL  endereço do servidor (padrão: http://localhost:3000)
+//!   BIPLAS_API_KEY     chave enviada em x-api-key, se o servidor exigir
+//!   SAIDA_DIR          pasta de planilhas/cache (padrão: ./relatorios)
+//!
+//! O `.env` é procurado na pasta atual e nas acima dela; se não achar, na pasta
+//! do executável e nas acima. Variáveis já definidas no sistema têm prioridade.
 
 mod api;
 mod calculo;
@@ -21,10 +25,26 @@ mod modelo;
 mod parcial;
 mod relatorio;
 mod simulacao;
+mod trello;
 
 use anyhow::Result;
 
+/// Carrega o `.env` da pasta atual (ou acima); se não houver, o da pasta do executável
+/// (ou acima), para funcionar também ao abrir o `.exe` direto de `target\release`.
+fn carregar_env() {
+    if dotenvy::dotenv().is_ok() {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else { return };
+    for pasta in exe.ancestors().skip(1) {
+        if dotenvy::from_path(pasta.join(".env")).is_ok() {
+            return;
+        }
+    }
+}
+
 fn main() {
+    carregar_env();
     if std::env::args().any(|a| a == "--cli") {
         if let Err(e) = executar_cli() {
             eprintln!("\nERRO: {e:#}");
@@ -37,8 +57,8 @@ fn main() {
 }
 
 fn executar_cli() -> Result<()> {
-    let base = coleta::url_api();
-    println!("Gateway: {base}");
+    let base = api::url_servidor();
+    println!("Servidor: {base}");
     let mut ultima_etapa = String::new();
     let brutos = coleta::coletar(&base, &mut |p| {
         // Imprime só quando muda a "família" da etapa, para não poluir.
