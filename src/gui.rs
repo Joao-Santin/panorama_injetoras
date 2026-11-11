@@ -12,9 +12,9 @@ use iced::{
     Element, Font,
     Length::{Fill, FillPortion},
     Subscription, Task, Theme, font,
-    alignment::Horizontal::Right,
+    alignment::Horizontal::{self, Left, Right},
     widget::{
-        Column, button, center, checkbox, column, container, operation, pick_list, progress_bar, row, rule, scrollable,
+        Column, button, canvas, center, checkbox, column, container, operation, pick_list, progress_bar, row, rule, scrollable,
         space, table, text, text_input, toggler,
     },
 };
@@ -23,7 +23,7 @@ use crate::{
     api::{self, Servidor},
     calculo::{self, Alerta, Necessidade, Resultado},
     coleta::{self, Analise, DadosBrutos, Progresso},
-    colunas::{AcaoColuna, Coluna, ColunaNec, ColunaProd, ConfigColunas},
+    colunas::{AcaoColuna, Alvo, Coluna, ColunaNec, ColunaProd, ConfigColunas, CorColuna, Rgb},
     config,
     estrutura::{self, Estrutura, MaterialSomado, No, TipoNo},
     fmt,
@@ -31,6 +31,7 @@ use crate::{
     modelo::{ItemComposicao, ItemOp, Op, Produto},
     notificacoes::{self, Aviso, EstadoSync},
     parcial::{self, Campos, Confirmacao, Grupo, Lancamento},
+    seletor_cor::{Hsv, Seletor},
     simulacao::{self, Simulacao, Simulado},
     trello::{self, Etapa, Situacao, Situacoes},
 };
@@ -248,6 +249,15 @@ pub enum Message {
     GrupoRemover(i64),
     GrupoLimpar,
     Colunas(Tabela, AcaoColuna),
+    /// Abre (ou fecha) o seletor de cores da coluna `usize` da tabela.
+    CorAbrir(Tabela, usize),
+    CorAlvo(Alvo),
+    CorMudou(Hsv),
+    CorHex(String),
+    /// Volta a cor escolhida (fundo ou texto) ao padrão do tema.
+    CorPadrao,
+    CorOk,
+    CorCancelar,
     SelMaterial(i64),
     FecharMaterial,
     VerMaterial(i64),
@@ -351,6 +361,30 @@ impl Paginacao {
     }
 }
 
+/// Seletor de cores aberto para uma coluna. As mudanças aparecem na hora na
+/// tabela; só vão para o servidor ao fechar (Cancelar volta como estava).
+#[derive(Debug, Clone)]
+pub struct EditorCor {
+    tabela: Tabela,
+    /// Posição da coluna em `colunas`.
+    i: usize,
+    alvo: Alvo,
+    /// Cores de quando o seletor abriu.
+    original: CorColuna,
+    hsv: Hsv,
+    hex: String,
+}
+
+/// Cor inicial do seletor quando a coluna ainda usa a padrão: amarelo claro
+/// para o fundo, azul escuro para o texto.
+fn hsv_inicial(cor: CorColuna, alvo: Alvo) -> Hsv {
+    match (cor.de(alvo), alvo) {
+        (Some(c), _) => Hsv::de_rgb(c, 0.0),
+        (None, Alvo::Fundo) => Hsv { h: 50.0, s: 0.35, v: 1.0 },
+        (None, Alvo::Texto) => Hsv { h: 220.0, s: 0.8, v: 0.55 },
+    }
+}
+
 pub struct App {
     analise: Option<Analise>,
     /// Andamento da sincronização do eGestor no servidor (vale para todos os panoramas abertos).
@@ -408,6 +442,8 @@ pub struct App {
     so_negativos: bool,
     config_prod: ConfigColunas<ColunaProd>,
     modo_config_prod: bool,
+    /// Seletor de cores aberto no painel "Configurar colunas".
+    editor_cor: Option<EditorCor>,
     produto_sel: Option<i64>,
     pagina_prod: usize,
     visao_composicao: VisaoComposicao,
@@ -589,6 +625,7 @@ impl App {
             so_negativos: false,
             config_prod: ConfigColunas::default(),
             modo_config_prod: false,
+            editor_cor: None,
             produto_sel: None,
             pagina_prod: 0,
             visao_composicao: VisaoComposicao::Direta,
@@ -681,6 +718,8 @@ impl App {
             }
             Message::Recarga(Ok(r)) => match r {
                 Recarga::Colunas(nec, prod) => {
+                    // A configuração veio de novo do servidor: o que estava em edição se perde.
+                    self.editor_cor = None;
                     self.config_nec = nec;
                     self.config_prod = prod;
                 }
@@ -746,10 +785,16 @@ impl App {
             Message::ModoConfigNec(b) => {
                 self.modo_config_nec = b;
                 self.modo_simulacoes &= !b;
+                if !b && self.editor_cor.as_ref().is_some_and(|e| e.tabela == Tabela::Necessidades) {
+                    return self.fechar_editor_cor(true);
+                }
             }
             Message::ModoSimulacoes(b) => {
                 self.modo_simulacoes = b;
                 self.modo_config_nec &= !b;
+                if b && self.editor_cor.as_ref().is_some_and(|e| e.tabela == Tabela::Necessidades) {
+                    return self.fechar_editor_cor(true);
+                }
             }
             Message::SimBusca(s) => {
                 self.busca_sim = s;
@@ -824,18 +869,62 @@ impl App {
                 self.recalcular_grupo();
             }
             Message::Colunas(tabela, acao) => {
-                let pedido = match tabela {
-                    Tabela::Necessidades => {
-                        self.config_nec.aplicar(acao);
-                        Pedido::Colunas(ColunaNec::TABELA, serde_json::to_value(&self.config_nec).expect("serializável"))
-                    }
-                    Tabela::Produtos => {
-                        self.config_prod.aplicar(acao);
-                        Pedido::Colunas(ColunaProd::TABELA, serde_json::to_value(&self.config_prod).expect("serializável"))
-                    }
-                };
-                return self.gravar(pedido);
+                // Mover colunas muda as posições: o seletor aberto grava e fecha antes.
+                let antes = self.fechar_editor_cor(true);
+                match tabela {
+                    Tabela::Necessidades => self.config_nec.aplicar(acao),
+                    Tabela::Produtos => self.config_prod.aplicar(acao),
+                }
+                return Task::batch([antes, self.gravar_colunas(tabela)]);
             }
+            Message::CorAbrir(tabela, i) => {
+                let mesmo = self.editor_cor.as_ref().is_some_and(|e| e.tabela == tabela && e.i == i);
+                let antes = self.fechar_editor_cor(true);
+                if !mesmo {
+                    let original = self.cores_coluna(tabela, i);
+                    let hsv = hsv_inicial(original, Alvo::Fundo);
+                    let hex = original.fundo.map(Rgb::hex).unwrap_or_default();
+                    self.editor_cor = Some(EditorCor { tabela, i, alvo: Alvo::Fundo, original, hsv, hex });
+                }
+                return antes;
+            }
+            Message::CorAlvo(alvo) => {
+                if let Some(e) = &self.editor_cor {
+                    let atual = self.cores_coluna(e.tabela, e.i);
+                    let e = self.editor_cor.as_mut().expect("aberto");
+                    e.alvo = alvo;
+                    e.hsv = hsv_inicial(atual, alvo);
+                    e.hex = atual.de(alvo).map(Rgb::hex).unwrap_or_default();
+                }
+            }
+            Message::CorMudou(hsv) => {
+                if let Some(e) = self.editor_cor.as_mut() {
+                    e.hsv = hsv;
+                    e.hex = hsv.rgb().hex();
+                    let (tabela, i, alvo) = (e.tabela, e.i, e.alvo);
+                    self.mudar_cor_local(tabela, i, alvo, Some(hsv.rgb()));
+                }
+            }
+            Message::CorHex(s) => {
+                if let Some(e) = self.editor_cor.as_mut() {
+                    let lida = Rgb::do_hex(&s);
+                    e.hex = s;
+                    if let Some(c) = lida {
+                        e.hsv = Hsv::de_rgb(c, e.hsv.h);
+                        let (tabela, i, alvo) = (e.tabela, e.i, e.alvo);
+                        self.mudar_cor_local(tabela, i, alvo, Some(c));
+                    }
+                }
+            }
+            Message::CorPadrao => {
+                if let Some(e) = self.editor_cor.as_mut() {
+                    e.hex.clear();
+                    let (tabela, i, alvo) = (e.tabela, e.i, e.alvo);
+                    self.mudar_cor_local(tabela, i, alvo, None);
+                }
+            }
+            Message::CorOk => return self.fechar_editor_cor(true),
+            Message::CorCancelar => return self.fechar_editor_cor(false),
             Message::SelMaterial(c) => self.material_sel = Some(c),
             Message::FecharMaterial => self.material_sel = None,
             Message::VerMaterial(c) => {
@@ -893,7 +982,12 @@ impl App {
                 self.so_usados = b;
                 return self.ir_para_pagina_prod(0);
             }
-            Message::ModoConfigProd(b) => self.modo_config_prod = b,
+            Message::ModoConfigProd(b) => {
+                self.modo_config_prod = b;
+                if !b && self.editor_cor.as_ref().is_some_and(|e| e.tabela == Tabela::Produtos) {
+                    return self.fechar_editor_cor(true);
+                }
+            }
             Message::SelProduto(c) => {
                 // Cada produto começa em 1: a quantidade de um não vale para o outro.
                 if self.produto_sel != Some(c) {
@@ -926,7 +1020,12 @@ impl App {
                 self.cfg_usuario = s;
                 self.cfg_status_usuario = None;
             }
-            Message::ConfigSalvarUsuario => self.salvar_usuario(),
+            Message::ConfigSalvarUsuario => {
+                // As colunas são de cada usuário: com outro nome, vêm as desse usuário.
+                if self.salvar_usuario() {
+                    return carregar_colunas();
+                }
+            }
             Message::HistFiltro(f) => {
                 self.hist_filtro = f;
                 self.historico.clear();
@@ -1011,18 +1110,74 @@ impl App {
         )
     }
 
-    fn salvar_usuario(&mut self) {
+    /// Devolve se salvou.
+    fn salvar_usuario(&mut self) -> bool {
         let nome = self.cfg_usuario.trim().to_string();
         let mut nova = config::atual();
         nova.usuario = (!nome.is_empty()).then_some(nome);
         if let Err(e) = config::salvar(nova.clone()) {
             self.cfg_status_usuario = Some((true, format!("Não salvei: {e:#}")));
-            return;
+            return false;
         }
         self.cfg_usuario = nova.usuario.unwrap_or_default();
         // A conexão de avisos é refeita com o nome novo (ela é quem aparece em "Usuários ativos").
         self.usuario = config::usuario();
-        self.cfg_status_usuario = Some((false, format!("Salvo. As próximas ações serão registradas como \"{}\".", self.usuario)));
+        self.cfg_status_usuario = Some((false, format!("Salvo. As próximas ações serão registradas como \"{}\", e as colunas passam a ser as desse usuário.", self.usuario)));
+        true
+    }
+
+    /// Envia ao servidor a configuração de colunas da tabela.
+    fn gravar_colunas(&self, tabela: Tabela) -> Task<Message> {
+        let pedido = match tabela {
+            Tabela::Necessidades => {
+                Pedido::Colunas(ColunaNec::TABELA, serde_json::to_value(&self.config_nec).expect("serializável"))
+            }
+            Tabela::Produtos => Pedido::Colunas(ColunaProd::TABELA, serde_json::to_value(&self.config_prod).expect("serializável")),
+        };
+        self.gravar(pedido)
+    }
+
+    fn cores_coluna(&self, tabela: Tabela, i: usize) -> CorColuna {
+        match tabela {
+            Tabela::Necessidades => self.config_nec.colunas.get(i).map(|&(c, _)| self.config_nec.cor_de(c)),
+            Tabela::Produtos => self.config_prod.colunas.get(i).map(|&(c, _)| self.config_prod.cor_de(c)),
+        }
+        .unwrap_or_default()
+    }
+
+    /// Muda a cor só na tela (prévia); vai para o servidor ao fechar o seletor.
+    fn mudar_cor_local(&mut self, tabela: Tabela, i: usize, alvo: Alvo, cor: Option<Rgb>) {
+        match tabela {
+            Tabela::Necessidades => self.config_nec.aplicar(AcaoColuna::Cor(i, alvo, cor)),
+            Tabela::Produtos => self.config_prod.aplicar(AcaoColuna::Cor(i, alvo, cor)),
+        }
+    }
+
+    /// Fecha o seletor de cores: `salvar` grava as cores escolhidas (se mudaram);
+    /// senão, volta às de quando abriu.
+    fn fechar_editor_cor(&mut self, salvar: bool) -> Task<Message> {
+        let Some(e) = self.editor_cor.take() else {
+            return Task::none();
+        };
+        if self.cores_coluna(e.tabela, e.i) == e.original {
+            return Task::none();
+        }
+        if salvar {
+            return self.gravar_colunas(e.tabela);
+        }
+        match e.tabela {
+            Tabela::Necessidades => {
+                if let Some(&(c, _)) = self.config_nec.colunas.get(e.i) {
+                    self.config_nec.definir_cores(c, e.original);
+                }
+            }
+            Tabela::Produtos => {
+                if let Some(&(c, _)) = self.config_prod.colunas.get(e.i) {
+                    self.config_prod.definir_cores(c, e.original);
+                }
+            }
+        }
+        Task::none()
     }
 
     /// Pede ao servidor para ler o Trello de novo; a situação nova chega pelos avisos.
@@ -1526,7 +1681,7 @@ impl App {
         let mudou_nome = Some(nome_digitado).filter(|n| !n.is_empty()).map(String::from) != config::atual().usuario;
         let mut usuario = column![
             text("Usuário").size(18).font(NEGRITO),
-            text("Nome de quem usa o programa neste computador. É o que aparece no histórico e em Usuários ativos.")
+            text("Nome de quem usa o programa neste computador. É o que aparece no histórico e em Usuários ativos, e cada usuário tem a sua configuração de colunas.")
                 .size(13)
                 .style(text::secondary),
             row![
@@ -1726,18 +1881,19 @@ impl App {
         let sel = self.material_sel;
         // O cabeçalho é uma tabela à parte, fora da rolagem, para não descer com a lista. As colunas
         // são todas proporcionais: com a mesma largura disponível, as duas tabelas ficam alinhadas.
-        let titulos: Vec<_> = self.config_nec.visiveis().map(|c| coluna_necessidade(c, sel, cab(c.rotulo()).into())).collect();
+        // O espaçamento das células fica dentro delas (`pintar`), para a cor preencher a coluna.
+        let titulos: Vec<_> = self.config_nec.visiveis().map(|c| coluna_necessidade(c, self.config_nec.cor_de(c), sel, cab(c.rotulo()).into())).collect();
         let sem_linhas: [&'a Necessidade; 0] = [];
-        let cabecalho = container(table::table(titulos, sem_linhas).padding_x(8).padding_y(4).width(Fill))
+        let cabecalho = container(table::table(titulos, sem_linhas).padding(0).width(Fill))
             .padding(iced::Padding { right: FOLGA_ROLAGEM, ..iced::Padding::ZERO })
             .width(Fill)
             .style(container::rounded_box);
-        let colunas: Vec<_> = self.config_nec.visiveis().map(|c| coluna_necessidade(c, sel, space().into())).collect();
-        let lista = rolagem(table::table(colunas, linhas).padding_x(8).padding_y(4).width(Fill)).height(Fill);
+        let colunas: Vec<_> = self.config_nec.visiveis().map(|c| coluna_necessidade(c, self.config_nec.cor_de(c), sel, space().into())).collect();
+        let lista = rolagem(table::table(colunas, linhas).padding(0).width(Fill)).height(Fill);
         let tabela = column![cabecalho, lista].width(Fill);
         // Em modo de configuração, o painel fica à direita da tabela (prévia ao vivo).
         let tabela: Element<'a, Message> = if self.modo_config_nec {
-            row![container(tabela).width(Fill), view_config_colunas(&self.config_nec, Tabela::Necessidades)].spacing(12).into()
+            row![container(tabela).width(Fill), view_config_colunas(&self.config_nec, Tabela::Necessidades, self.editor_cor.as_ref())].spacing(12).into()
         } else if self.modo_simulacoes {
             row![container(tabela).width(Fill), self.view_simulacoes(a)].spacing(12).into()
         } else {
@@ -2528,19 +2684,19 @@ impl App {
         .align_y(Center);
 
         let sel = self.produto_sel;
-        let colunas: Vec<_> = self.config_prod.visiveis().map(|c| coluna_produto(c, a, sel, &self.produzido_parcial)).collect();
+        let colunas: Vec<_> = self.config_prod.visiveis().map(|c| coluna_produto(c, self.config_prod.cor_de(c), a, sel, &self.produzido_parcial)).collect();
         let mut lista = column![].spacing(8);
         if pag.ultima > 0 {
             lista = lista.push(view_paginacao(pag));
         }
-        lista = lista.push(table::table(colunas, linhas).padding_x(8).padding_y(4).width(Fill));
+        lista = lista.push(table::table(colunas, linhas).padding(0).width(Fill));
         if pag.ultima > 0 {
             lista = lista.push(view_paginacao(pag));
         }
         let tabela = rolagem(lista).id(ID_LISTA_PRODUTOS);
         // Em modo de configuração, o painel fica à direita da tabela (prévia ao vivo).
         let tabela: Element<'a, Message> = if self.modo_config_prod {
-            row![container(tabela).width(Fill), view_config_colunas(&self.config_prod, Tabela::Produtos)].spacing(12).into()
+            row![container(tabela).width(Fill), view_config_colunas(&self.config_prod, Tabela::Produtos, self.editor_cor.as_ref())].spacing(12).into()
         } else {
             tabela.into()
         };
@@ -2581,9 +2737,14 @@ fn botao_config_colunas<'a>(ativo: bool, ao_clicar: Message) -> Element<'a, Mess
 }
 
 /// Painel do modo de configuração: marcar/desmarcar colunas e mudar a ordem.
-fn view_config_colunas<'a, C: Coluna>(cfg: &'a ConfigColunas<C>, tabela: Tabela) -> Element<'a, Message> {
+fn view_config_colunas<'a, C: Coluna>(
+    cfg: &'a ConfigColunas<C>,
+    tabela: Tabela,
+    editor: Option<&'a EditorCor>,
+) -> Element<'a, Message> {
     let acao = move |a: AcaoColuna| Message::Colunas(tabela, a);
     let total = cfg.colunas.len();
+    let editor = editor.filter(|e| e.tabela == tabela);
     let mut lista = column![].spacing(4);
     for (i, (c, visivel)) in cfg.colunas.iter().enumerate() {
         let (c, visivel) = (*c, *visivel);
@@ -2598,6 +2759,7 @@ fn view_config_colunas<'a, C: Coluna>(cfg: &'a ConfigColunas<C>, tabela: Tabela)
                 .on_press_maybe(destino.map(|d| acao(AcaoColuna::Mover(i, d))))
         };
         let estilo_ordem: EstiloTexto = if visivel { text::base } else { text::secondary };
+        let aberto = editor.is_some_and(|e| e.i == i);
         lista = lista.push(
             container(
                 row![
@@ -2605,6 +2767,7 @@ fn view_config_colunas<'a, C: Coluna>(cfg: &'a ConfigColunas<C>, tabela: Tabela)
                     marcador,
                     if c.obrigatoria() { text(" (fixa)").size(11).style(text::secondary) } else { text("") },
                     space::horizontal(),
+                    amostra_cor(cfg.cor_de(c), aberto, Message::CorAbrir(tabela, i)),
                     seta("⤒", (i > 0).then_some(0)),
                     seta("↑", (i > 0).then(|| i - 1)),
                     seta("↓", (i + 1 < total).then_some(i + 1)),
@@ -2616,6 +2779,9 @@ fn view_config_colunas<'a, C: Coluna>(cfg: &'a ConfigColunas<C>, tabela: Tabela)
             .padding([3, 6])
             .style(if visivel { container::rounded_box } else { container::transparent }),
         );
+        if let Some(e) = editor.filter(|_| aberto) {
+            lista = lista.push(view_editor_cor(e, cfg.cor_de(c)));
+        }
     }
     let n_vis = cfg.visiveis().count();
     container(
@@ -2623,7 +2789,8 @@ fn view_config_colunas<'a, C: Coluna>(cfg: &'a ConfigColunas<C>, tabela: Tabela)
             text("Configurar colunas").size(15).font(NEGRITO),
             text(format!(
                 "{n_vis} de {total} visíveis. Marque as que quer ver e use as setas para mudar a ordem \
-                 (⤒ topo · ↑ subir · ↓ descer · ⤓ fim). Salvo automaticamente."
+                 (⤒ topo · ↑ subir · ↓ descer · ⤓ fim). Clique em \"Aa\" para escolher as cores da coluna. \
+                 Salvo automaticamente, só para o seu usuário."
             ))
             .size(12)
             .style(text::secondary),
@@ -2638,10 +2805,136 @@ fn view_config_colunas<'a, C: Coluna>(cfg: &'a ConfigColunas<C>, tabela: Tabela)
         .spacing(8),
     )
     .padding(12)
-    .width(400)
+    .width(440)
     .height(Fill)
     .style(container::bordered_box)
     .into()
+}
+
+/// Botão "Aa" com as cores da coluna (fundo e texto), que abre o seletor.
+fn amostra_cor<'a>(cor: CorColuna, aberto: bool, ao_clicar: Message) -> Element<'a, Message> {
+    button(text("Aa").size(12).font(NEGRITO))
+        .padding([2, 8])
+        .style(move |theme: &Theme, status| {
+            let p = theme.extended_palette();
+            let base = button::secondary(theme, status);
+            button::Style {
+                background: Some(cor.fundo.map_or(p.background.base.color, iced::Color::from).into()),
+                text_color: cor.texto.map_or(p.background.base.text, iced::Color::from),
+                border: iced::Border {
+                    radius: 4.0.into(),
+                    width: if aberto { 2.0 } else { 1.0 },
+                    color: if aberto { p.primary.strong.color } else { p.background.strong.color },
+                },
+                ..base
+            }
+        })
+        .on_press(ao_clicar)
+        .into()
+}
+
+/// Seletor de cores aberto embaixo da coluna: fundo ou texto, anel, código e botões.
+fn view_editor_cor<'a>(e: &'a EditorCor, cor: CorColuna) -> Element<'a, Message> {
+    let alvo = |rotulo: &'static str, a: Alvo| {
+        button(text(rotulo).size(12))
+            .padding([3, 10])
+            .style(if e.alvo == a { button::primary } else { button::secondary })
+            .on_press(Message::CorAlvo(a))
+    };
+    let usa_padrao = cor.de(e.alvo).is_none();
+    let exemplo = container(text("Exemplo 1.234").size(13))
+        .padding([4, 8])
+        .width(Fill)
+        .style(move |theme: &Theme| estilo_celula(theme, cor));
+    let anel = canvas(Seletor { hsv: e.hsv, ao_mudar: Message::CorMudou }).width(170).height(170);
+    let lado = column![
+        exemplo,
+        text("Código da cor").size(11).style(text::secondary),
+        text_input("#RRGGBB", &e.hex).on_input(Message::CorHex).on_submit(Message::CorOk).size(12).padding([4, 8]),
+        if usa_padrao {
+            text("Usando a cor padrão").size(11).style(text::secondary)
+        } else if Rgb::do_hex(&e.hex).is_none() {
+            text("Código inválido").size(11).style(text::warning)
+        } else {
+            text("")
+        },
+        button(text("Voltar ao padrão").size(12))
+            .padding([3, 10])
+            .style(button::secondary)
+            .on_press_maybe((!usa_padrao).then_some(Message::CorPadrao)),
+    ]
+    .spacing(6)
+    .width(Fill);
+    container(
+        column![
+            row![alvo("Fundo", Alvo::Fundo), alvo("Texto", Alvo::Texto)].spacing(6),
+            row![anel, lado].spacing(10),
+            row![
+                space::horizontal(),
+                button(text("Cancelar").size(12)).padding([3, 12]).style(button::secondary).on_press(Message::CorCancelar),
+                button(text("OK").size(12)).padding([3, 16]).style(button::primary).on_press(Message::CorOk),
+            ]
+            .spacing(8),
+        ]
+        .spacing(8),
+    )
+    .padding(8)
+    .style(container::bordered_box)
+    .into()
+}
+
+/// Fundo e cor de texto escolhidos para a coluna (o que não foi escolhido fica como o tema).
+fn estilo_celula(_theme: &Theme, cor: CorColuna) -> container::Style {
+    container::Style {
+        background: cor.fundo.map(|c| iced::Color::from(c).into()),
+        text_color: cor.texto.map(iced::Color::from),
+        ..container::Style::default()
+    }
+}
+
+/// Célula de tabela com as cores da coluna. O espaçamento fica dentro da célula
+/// (a tabela fica sem `padding`), para o fundo preencher a coluna toda.
+fn pintar<'a>(cor: CorColuna, alinhar: Horizontal, conteudo: Element<'a, Message>) -> Element<'a, Message> {
+    container(conteudo).padding([4, 8]).width(Fill).align_x(alinhar).style(move |t: &Theme| estilo_celula(t, cor)).into()
+}
+
+/// Coluna de texto com as cores escolhidas.
+fn col_cor<'a, 'b, T: 'a, E: Into<Element<'a, Message>>>(
+    cor: CorColuna,
+    cabecalho: Element<'a, Message>,
+    peso: u16,
+    f: impl Fn(T) -> E + 'b,
+) -> table::Column<'a, 'b, T, Message> {
+    table::column(pintar(cor, Left, cabecalho), move |t| pintar(cor, Left, f(t).into())).width(FillPortion(peso))
+}
+
+/// Coluna numérica (alinhada à direita) com as cores escolhidas.
+fn col_num_cor<'a, 'b, T: 'a, E: Into<Element<'a, Message>>>(
+    cor: CorColuna,
+    cabecalho: Element<'a, Message>,
+    peso: u16,
+    f: impl Fn(T) -> E + 'b,
+) -> table::Column<'a, 'b, T, Message> {
+    table::column(pintar(cor, Right, cabecalho), move |t| pintar(cor, Right, f(t).into())).width(FillPortion(peso))
+}
+
+/// Texto sem cor própria: usa a da coluna, se houver, senão a do tema.
+fn sem_cor(_: &Theme) -> text::Style {
+    text::Style::default()
+}
+
+/// Botão de texto (Material, Descrição) que respeita a cor de texto da coluna.
+fn botao_da_coluna(cor: CorColuna, selecionado: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |theme, status| {
+        if selecionado {
+            return button::primary(theme, status);
+        }
+        let mut s = button::text(theme, status);
+        if let Some(c) = cor.texto {
+            s.text_color = c.into();
+        }
+        s
+    }
 }
 
 /// Barra de navegação entre páginas, repetida no começo e no fim da lista.
@@ -2666,47 +2959,46 @@ fn view_paginacao<'a>(p: Paginacao) -> Element<'a, Message> {
 /// Monta uma coluna da tabela de Produtos.
 fn coluna_produto<'a>(
     c: ColunaProd,
+    cor: CorColuna,
     a: &'a Analise,
     sel: Option<i64>,
     produzido: &'a HashMap<i64, f64>,
 ) -> table::Column<'a, 'a, &'a Produto, Message> {
     type P<'x> = &'x Produto;
-    let titulo = c.rotulo();
+    let titulo = cab(c.rotulo()).into();
     let produzido_de = move |p: P<'a>| produzido.get(&p.codigo).copied().unwrap_or(0.0);
     match c {
-        ColunaProd::Codigo => col_num(titulo, 1, |p: P<'a>| cel(p.codigo.to_string())),
-        ColunaProd::CodigoProprio => table::column(cab(titulo), |p: P<'a>| cel(p.codigo_proprio.as_str())).width(FillPortion(2)),
-        ColunaProd::Descricao => table::column(cab(titulo), move |p: P<'a>| {
-            let estilo: EstiloBotao = if sel == Some(p.codigo) { button::primary } else { button::text };
-            button(text(p.descricao.as_str()).size(13)).padding([1, 4]).style(estilo).on_press(Message::SelProduto(p.codigo))
-        })
-        .width(FillPortion(6)),
-        ColunaProd::Categoria => {
-            table::column(cab(titulo), move |p: P<'a>| cel(a.categoria_de(p.cod_categoria))).width(FillPortion(2))
-        }
-        ColunaProd::Composicao => table::column(cab(titulo), move |p: P<'a>| match &a.composicoes {
+        ColunaProd::Codigo => col_num_cor(cor, titulo, 1, |p: P<'a>| cel(p.codigo.to_string())),
+        ColunaProd::CodigoProprio => col_cor(cor, titulo, 2, |p: P<'a>| cel(p.codigo_proprio.as_str())),
+        ColunaProd::Descricao => col_cor(cor, titulo, 6, move |p: P<'a>| {
+            button(text(p.descricao.as_str()).size(13))
+                .padding([1, 4])
+                .style(botao_da_coluna(cor, sel == Some(p.codigo)))
+                .on_press(Message::SelProduto(p.codigo))
+        }),
+        ColunaProd::Categoria => col_cor(cor, titulo, 2, move |p: P<'a>| cel(a.categoria_de(p.cod_categoria))),
+        ColunaProd::Composicao => col_cor(cor, titulo, 2, move |p: P<'a>| match &a.composicoes {
             None => cel("—").style(text::secondary),
             Some(m) if m.contains_key(&p.codigo) => cel("Sim").style(text::success),
             Some(_) => cel("Não").style(text::secondary),
-        })
-        .width(FillPortion(2)),
-        ColunaProd::Unidade => table::column(cab(titulo), |p: P<'a>| cel(p.unidade.as_str())).width(FillPortion(1)),
-        ColunaProd::Estoque => col_num(titulo, 2, |p: P<'a>| {
-            cel(fmt::qtd(p.estoque)).style(if p.estoque < 0.0 { text::danger } else { text::base })
         }),
-        ColunaProd::ProduzidoParcial => col_num(titulo, 2, move |p: P<'a>| match produzido_de(p) {
+        ColunaProd::Unidade => col_cor(cor, titulo, 1, |p: P<'a>| cel(p.unidade.as_str())),
+        ColunaProd::Estoque => col_num_cor(cor, titulo, 2, |p: P<'a>| {
+            cel(fmt::qtd(p.estoque)).style(if p.estoque < 0.0 { text::danger } else { sem_cor })
+        }),
+        ColunaProd::ProduzidoParcial => col_num_cor(cor, titulo, 2, move |p: P<'a>| match produzido_de(p) {
             v if v > 0.0 => cel(fmt::qtd(v)),
             _ => cel("—").style(text::secondary),
         }),
-        ColunaProd::EstoqueReal => col_num(titulo, 2, move |p: P<'a>| {
+        ColunaProd::EstoqueReal => col_num_cor(cor, titulo, 2, move |p: P<'a>| {
             let real = p.estoque + produzido_de(p);
-            cel(fmt::qtd(real)).style(if real < 0.0 { text::danger } else { text::base })
+            cel(fmt::qtd(real)).style(if real < 0.0 { text::danger } else { sem_cor })
         }),
-        ColunaProd::EstoqueMinimo => col_num(titulo, 2, |p: P<'a>| cel(fmt::qtd(p.estoque_minimo))),
-        ColunaProd::PesoLiquido => col_num(titulo, 2, |p: P<'a>| cel(fmt::num(p.peso_liquido, 4))),
-        ColunaProd::PrecoCusto => col_num(titulo, 2, |p: P<'a>| cel(fmt::moeda(p.preco_custo))),
-        ColunaProd::PrecoVenda => col_num(titulo, 2, |p: P<'a>| cel(fmt::moeda(p.preco_venda))),
-        ColunaProd::Tags => table::column(cab(titulo), |p: P<'a>| cel(p.tags.join(", "))).width(FillPortion(3)),
+        ColunaProd::EstoqueMinimo => col_num_cor(cor, titulo, 2, |p: P<'a>| cel(fmt::qtd(p.estoque_minimo))),
+        ColunaProd::PesoLiquido => col_num_cor(cor, titulo, 2, |p: P<'a>| cel(fmt::num(p.peso_liquido, 4))),
+        ColunaProd::PrecoCusto => col_num_cor(cor, titulo, 2, |p: P<'a>| cel(fmt::moeda(p.preco_custo))),
+        ColunaProd::PrecoVenda => col_num_cor(cor, titulo, 2, |p: P<'a>| cel(fmt::moeda(p.preco_venda))),
+        ColunaProd::Tags => col_cor(cor, titulo, 3, |p: P<'a>| cel(p.tags.join(", "))),
     }
 }
 
@@ -2989,56 +3281,59 @@ fn celula_saldo<'a>(saldo: f64) -> iced::widget::Text<'a> {
 /// Monta uma coluna da tabela de Necessidades.
 fn coluna_necessidade<'a>(
     c: ColunaNec,
+    cor: CorColuna,
     sel: Option<i64>,
     cabecalho: Element<'a, Message>,
 ) -> table::Column<'a, 'a, &'a Necessidade, Message> {
     type N<'x> = &'x Necessidade;
     match c {
-        ColunaNec::Material => table::column(cabecalho, move |n: N<'a>| {
-            let estilo: EstiloBotao = if sel == Some(n.cod_insumo) { button::primary } else { button::text };
-            button(text(n.descricao.as_str()).size(13)).padding([1, 4]).style(estilo).on_press(Message::SelMaterial(n.cod_insumo))
-        })
-        .width(FillPortion(6)),
-        ColunaNec::Codigo => col_num_com(cabecalho, 1, |n: N<'a>| cel(n.cod_insumo.to_string())),
-        ColunaNec::CodigoProprio => table::column(cabecalho, |n: N<'a>| cel(n.codigo_proprio.as_str())).width(FillPortion(2)),
-        ColunaNec::Categoria => table::column(cabecalho, |n: N<'a>| cel(n.categoria.as_str())).width(FillPortion(2)),
-        ColunaNec::Unidade => table::column(cabecalho, |n: N<'a>| cel(n.unidade.as_str())).width(FillPortion(1)),
-        ColunaNec::Necessidade => col_num_com(cabecalho, 2, |n: N<'a>| cel(fmt::qtd(n.necessidade))),
-        ColunaNec::Estoque => col_num_com(cabecalho, 2, |n: N<'a>| {
-            cel(fmt::qtd(n.estoque)).style(if n.estoque < 0.0 { text::danger } else { text::base })
+        ColunaNec::Material => col_cor(cor, cabecalho, 6, move |n: N<'a>| {
+            button(text(n.descricao.as_str()).size(13))
+                .padding([1, 4])
+                .style(botao_da_coluna(cor, sel == Some(n.cod_insumo)))
+                .on_press(Message::SelMaterial(n.cod_insumo))
         }),
-        ColunaNec::ConsumoParcial => col_num_com(cabecalho, 2, |n: N<'a>| {
+        ColunaNec::Codigo => col_num_cor(cor, cabecalho, 1, |n: N<'a>| cel(n.cod_insumo.to_string())),
+        ColunaNec::CodigoProprio => col_cor(cor, cabecalho, 2, |n: N<'a>| cel(n.codigo_proprio.as_str())),
+        ColunaNec::Categoria => col_cor(cor, cabecalho, 2, |n: N<'a>| cel(n.categoria.as_str())),
+        ColunaNec::Unidade => col_cor(cor, cabecalho, 1, |n: N<'a>| cel(n.unidade.as_str())),
+        ColunaNec::Necessidade => col_num_cor(cor, cabecalho, 2, |n: N<'a>| cel(fmt::qtd(n.necessidade))),
+        ColunaNec::Estoque => col_num_cor(cor, cabecalho, 2, |n: N<'a>| {
+            cel(fmt::qtd(n.estoque)).style(if n.estoque < 0.0 { text::danger } else { sem_cor })
+        }),
+        ColunaNec::ConsumoParcial => col_num_cor(cor, cabecalho, 2, |n: N<'a>| {
             if n.consumo_parcial > 0.0 { cel(fmt::qtd(n.consumo_parcial)) } else { cel("—").style(text::secondary) }
         }),
-        ColunaNec::EstoqueFisicoReal => col_num_com(cabecalho, 2, |n: N<'a>| {
+        ColunaNec::EstoqueFisicoReal => col_num_cor(cor, cabecalho, 2, |n: N<'a>| {
             let real = n.estoque_fisico_real();
-            cel(fmt::qtd(real)).style(if real < 0.0 { text::danger } else { text::base })
+            cel(fmt::qtd(real)).style(if real < 0.0 { text::danger } else { sem_cor })
         }),
-        ColunaNec::EstoqueMinimo => col_num_com(cabecalho, 2, |n: N<'a>| cel(fmt::qtd(n.estoque_minimo))),
-        ColunaNec::Saldo => col_num_com(cabecalho, 2, |n: N<'a>| celula_saldo(n.saldo())),
-        ColunaNec::NecessidadeSimulacao => col_num_com(cabecalho, 2, |n: N<'a>| {
+        ColunaNec::EstoqueMinimo => col_num_cor(cor, cabecalho, 2, |n: N<'a>| cel(fmt::qtd(n.estoque_minimo))),
+        ColunaNec::Saldo => col_num_cor(cor, cabecalho, 2, |n: N<'a>| celula_saldo(n.saldo())),
+        ColunaNec::NecessidadeSimulacao => col_num_cor(cor, cabecalho, 2, |n: N<'a>| {
             if n.simulada > 0.0 { cel(fmt::qtd(n.simulada)) } else { cel("—").style(text::secondary) }
         }),
-        ColunaNec::SaldoAposSimulacao => col_num_com(cabecalho, 2, |n: N<'a>| celula_saldo(n.saldo_apos_simulacao())),
-        ColunaNec::SaldoAposOpsESimulacao => col_num_com(cabecalho, 2, |n: N<'a>| celula_saldo(n.saldo_apos_ops_e_simulacao())),
-        ColunaNec::Falta => col_num_com(cabecalho, 2, |n: N<'a>| {
+        ColunaNec::SaldoAposSimulacao => col_num_cor(cor, cabecalho, 2, |n: N<'a>| celula_saldo(n.saldo_apos_simulacao())),
+        ColunaNec::SaldoAposOpsESimulacao => {
+            col_num_cor(cor, cabecalho, 2, |n: N<'a>| celula_saldo(n.saldo_apos_ops_e_simulacao()))
+        }
+        ColunaNec::Falta => col_num_cor(cor, cabecalho, 2, |n: N<'a>| {
             let e: EstiloTexto = if n.falta() > 0.0 { text::danger } else { text::secondary };
             cel(if n.falta() > 0.0 { fmt::qtd(n.falta()) } else { "—".into() }).style(e).font(NEGRITO)
         }),
-        ColunaNec::ComprarComMinimo => col_num_com(cabecalho, 2, |n: N<'a>| cel(fmt::qtd(n.comprar_com_minimo()))),
-        ColunaNec::CustoUnit => col_num_com(cabecalho, 2, |n: N<'a>| cel(fmt::moeda(n.custo_unit))),
-        ColunaNec::CustoNecessidade => col_num_com(cabecalho, 2, |n: N<'a>| cel(fmt::moeda(n.custo_necessidade()))),
-        ColunaNec::CustoFalta => col_num_com(cabecalho, 2, |n: N<'a>| cel(fmt::moeda(n.custo_falta()))),
+        ColunaNec::ComprarComMinimo => col_num_cor(cor, cabecalho, 2, |n: N<'a>| cel(fmt::qtd(n.comprar_com_minimo()))),
+        ColunaNec::CustoUnit => col_num_cor(cor, cabecalho, 2, |n: N<'a>| cel(fmt::moeda(n.custo_unit))),
+        ColunaNec::CustoNecessidade => col_num_cor(cor, cabecalho, 2, |n: N<'a>| cel(fmt::moeda(n.custo_necessidade()))),
+        ColunaNec::CustoFalta => col_num_cor(cor, cabecalho, 2, |n: N<'a>| cel(fmt::moeda(n.custo_falta()))),
         ColunaNec::ControlaEstoque => {
-            table::column(cabecalho, |n: N<'a>| cel(if n.controla_estoque { "Sim" } else { "Não" })).width(FillPortion(1))
+            col_cor(cor, cabecalho, 1, |n: N<'a>| cel(if n.controla_estoque { "Sim" } else { "Não" }))
         }
-        ColunaNec::NumOps => col_num_com(cabecalho, 1, |n: N<'a>| cel(n.ops.len().to_string())),
-        ColunaNec::ListaOps => table::column(cabecalho, |n: N<'a>| {
+        ColunaNec::NumOps => col_num_cor(cor, cabecalho, 1, |n: N<'a>| cel(n.ops.len().to_string())),
+        ColunaNec::ListaOps => col_cor(cor, cabecalho, 3, |n: N<'a>| {
             cel(n.ops.iter().map(|o| o.to_string()).collect::<Vec<_>>().join(", "))
-        })
-        .width(FillPortion(3)),
-        ColunaNec::NumProdutos => col_num_com(cabecalho, 1, |n: N<'a>| cel(n.produtos.len().to_string())),
-        ColunaNec::Tags => table::column(cabecalho, |n: N<'a>| -> Element<'a, Message> {
+        }),
+        ColunaNec::NumProdutos => col_num_cor(cor, cabecalho, 1, |n: N<'a>| cel(n.produtos.len().to_string())),
+        ColunaNec::Tags => col_cor(cor, cabecalho, 3, |n: N<'a>| -> Element<'a, Message> {
             if n.tags.is_empty() {
                 cel("—").style(text::secondary).into()
             } else {
@@ -3048,8 +3343,7 @@ fn coluna_necessidade<'a>(
                 }
                 r.wrap().vertical_spacing(4).into()
             }
-        })
-        .width(FillPortion(3)),
+        }),
     }
 }
 

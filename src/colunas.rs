@@ -1,6 +1,6 @@
-//! Colunas configuráveis das tabelas (quais aparecem e em que ordem).
-//! A configuração de cada tabela fica no banco do servidor e vale para todos
-//! os computadores.
+//! Colunas configuráveis das tabelas (quais aparecem, em que ordem e com que
+//! cores). A configuração de cada tabela fica no banco do servidor, separada
+//! por usuário.
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -173,7 +173,8 @@ impl Coluna for ColunaProd {
 
 /// Mudança pedida no painel "Configurar colunas".
 /// Descreve a mudança de configuração de colunas guardada no histórico
-/// (`antes`/`depois` = lista `colunas` como o servidor guarda; `null` = padrão).
+/// (`antes`/`depois` = configuração inteira como o servidor guarda; registros
+/// antigos têm só a lista `colunas`; `null` = padrão).
 pub fn descrever_mudanca(tabela: &str, antes: &serde_json::Value, depois: &serde_json::Value) -> String {
     match tabela {
         ColunaNec::TABELA => descrever::<ColunaNec>("Necessidades", antes, depois),
@@ -183,7 +184,10 @@ pub fn descrever_mudanca(tabela: &str, antes: &serde_json::Value, depois: &serde
 }
 
 fn descrever<C: Coluna>(nome: &str, antes: &serde_json::Value, depois: &serde_json::Value) -> String {
-    let ler = |v: &serde_json::Value| ConfigColunas::<C>::do_servidor(serde_json::json!({ "colunas": v }));
+    let ler = |v: &serde_json::Value| {
+        let v = if v.is_object() { v.clone() } else { serde_json::json!({ "colunas": v }) };
+        ConfigColunas::<C>::do_servidor(v)
+    };
     let (a, d) = (ler(antes), ler(depois));
     let visivel = |cfg: &ConfigColunas<C>, c: C| cfg.colunas.iter().any(|(x, v)| *x == c && *v);
     let nomes = |lista: Vec<C>| lista.into_iter().map(Coluna::rotulo).collect::<Vec<_>>().join(", ");
@@ -201,10 +205,83 @@ fn descrever<C: Coluna>(nome: &str, antes: &serde_json::Value, depois: &serde_js
     if ordem(&a) != ordem(&d) {
         partes.push("mudou a ordem".to_string());
     }
+    let mudou_cor: Vec<C> = d.colunas.iter().map(|(c, _)| *c).filter(|&c| a.cor_de(c) != d.cor_de(c)).collect();
+    if !mudou_cor.is_empty() {
+        partes.push(format!("mudou as cores de {}", nomes(mudou_cor)));
+    }
     if partes.is_empty() {
         partes.push("sem mudança visível".to_string());
     }
     format!("Colunas de {nome}: {}", partes.join("; "))
+}
+
+/// Cor guardada como "#RRGGBB".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(into = "String", try_from = "String")]
+pub struct Rgb(pub u8, pub u8, pub u8);
+
+impl Rgb {
+    /// Lê "#RRGGBB" ou "RRGGBB".
+    pub fn do_hex(s: &str) -> Option<Self> {
+        let h = s.trim().trim_start_matches('#');
+        if h.len() != 6 || !h.is_ascii() {
+            return None;
+        }
+        let byte = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).ok();
+        Some(Self(byte(0)?, byte(2)?, byte(4)?))
+    }
+
+    pub fn hex(self) -> String {
+        format!("#{:02X}{:02X}{:02X}", self.0, self.1, self.2)
+    }
+}
+
+impl From<Rgb> for String {
+    fn from(c: Rgb) -> Self {
+        c.hex()
+    }
+}
+
+impl TryFrom<String> for Rgb {
+    type Error = String;
+    fn try_from(s: String) -> Result<Self, String> {
+        Self::do_hex(&s).ok_or_else(|| format!("cor inválida: {s}"))
+    }
+}
+
+impl From<Rgb> for iced::Color {
+    fn from(c: Rgb) -> Self {
+        iced::Color::from_rgb8(c.0, c.1, c.2)
+    }
+}
+
+/// Cores escolhidas para uma coluna; `None` = a cor padrão do tema.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CorColuna {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fundo: Option<Rgb>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub texto: Option<Rgb>,
+}
+
+impl CorColuna {
+    pub fn padrao(self) -> bool {
+        self == Self::default()
+    }
+
+    pub fn de(self, alvo: Alvo) -> Option<Rgb> {
+        match alvo {
+            Alvo::Fundo => self.fundo,
+            Alvo::Texto => self.texto,
+        }
+    }
+}
+
+/// Qual cor da coluna se escolhe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Alvo {
+    Fundo,
+    Texto,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -212,6 +289,8 @@ pub enum AcaoColuna {
     Visivel(usize, bool),
     Mover(usize, usize),
     MostrarTodas,
+    /// Cor da coluna `usize` (posição em `colunas`); `None` = padrão.
+    Cor(usize, Alvo, Option<Rgb>),
     Padrao,
 }
 
@@ -219,11 +298,14 @@ pub enum AcaoColuna {
 #[serde(bound = "C: Coluna")]
 pub struct ConfigColunas<C> {
     pub colunas: Vec<(C, bool)>,
+    /// Só as colunas com alguma cor escolhida.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cores: Vec<(C, CorColuna)>,
 }
 
 impl<C: Coluna> Default for ConfigColunas<C> {
     fn default() -> Self {
-        Self { colunas: C::PADRAO.to_vec() }
+        Self { colunas: C::PADRAO.to_vec(), cores: Vec::new() }
     }
 }
 
@@ -231,7 +313,10 @@ impl<C: Coluna> ConfigColunas<C> {
     /// A partir do que o servidor guardou (`null` se nunca foi configurada);
     /// se não houver ou for inválido, usa o padrão.
     pub fn do_servidor(salva: serde_json::Value) -> Self {
-        let cfg: Self = serde_json::from_value(salva).unwrap_or_default();
+        // Cores inválidas não fazem perder a ordem e a visibilidade.
+        let cfg: Self = serde_json::from_value(salva.clone())
+            .or_else(|_| serde_json::from_value(serde_json::json!({ "colunas": salva["colunas"] })))
+            .unwrap_or_default();
         cfg.normalizada()
     }
 
@@ -254,7 +339,35 @@ impl<C: Coluna> ConfigColunas<C> {
                 *v = true;
             }
         }
+        let mut com_cor = Vec::new();
+        self.cores.retain(|(c, cor)| {
+            let fica = !cor.padrao() && !com_cor.contains(c);
+            com_cor.push(*c);
+            fica
+        });
         self
+    }
+
+    /// Cores da coluna (padrão se nenhuma foi escolhida).
+    pub fn cor_de(&self, c: C) -> CorColuna {
+        self.cores.iter().find(|(x, _)| *x == c).map(|(_, cor)| *cor).unwrap_or_default()
+    }
+
+    pub fn definir_cor(&mut self, c: C, alvo: Alvo, cor: Option<Rgb>) {
+        let mut nova = self.cor_de(c);
+        match alvo {
+            Alvo::Fundo => nova.fundo = cor,
+            Alvo::Texto => nova.texto = cor,
+        }
+        self.definir_cores(c, nova);
+    }
+
+    /// Troca as duas cores da coluna de uma vez (ex.: para desfazer uma edição).
+    pub fn definir_cores(&mut self, c: C, cor: CorColuna) {
+        self.cores.retain(|(x, _)| *x != c);
+        if !cor.padrao() {
+            self.cores.push((c, cor));
+        }
     }
 
     /// Aplica a mudança (quem chama envia a nova configuração ao servidor).
@@ -263,7 +376,13 @@ impl<C: Coluna> ConfigColunas<C> {
             AcaoColuna::Visivel(i, v) => self.definir_visivel(i, v),
             AcaoColuna::Mover(i, destino) => self.mover(i, destino),
             AcaoColuna::MostrarTodas => self.mostrar_todas(),
-            AcaoColuna::Padrao => *self = Self::default(),
+            AcaoColuna::Cor(i, alvo, cor) => {
+                if let Some(&(c, _)) = self.colunas.get(i) {
+                    self.definir_cor(c, alvo, cor);
+                }
+            }
+            // Volta a ordem e a visibilidade; as cores ficam (cada uma tem o seu "Padrão").
+            AcaoColuna::Padrao => *self = Self { cores: std::mem::take(&mut self.cores), ..Self::default() },
         }
     }
 
@@ -321,7 +440,7 @@ mod testes {
 
     #[test]
     fn colunas_novas_entram_no_fim_com_a_visibilidade_padrao() {
-        let salvo = ConfigColunas { colunas: vec![(ColunaNec::Tags, true), (ColunaNec::Material, true), (ColunaNec::Saldo, false)] };
+        let salvo = ConfigColunas { colunas: vec![(ColunaNec::Tags, true), (ColunaNec::Material, true), (ColunaNec::Saldo, false)], cores: Vec::new() };
         let c = salvo.normalizada();
 
         // A escolha salva é mantida.
@@ -338,6 +457,44 @@ mod testes {
         let c: ConfigColunas<ColunaNec> = serde_json::from_value(salvo.clone()).unwrap();
         assert_eq!(c.colunas, [(ColunaNec::Material, true), (ColunaNec::Tags, false)]);
         assert_eq!(serde_json::to_value(&c).unwrap(), salvo);
+    }
+
+    #[test]
+    fn cores_por_coluna() {
+        let mut c = ConfigColunas::<ColunaProd>::default();
+        let i = c.colunas.iter().position(|(c, _)| *c == ColunaProd::Estoque).unwrap();
+        c.aplicar(AcaoColuna::Cor(i, Alvo::Fundo, Some(Rgb(255, 238, 170))));
+        c.aplicar(AcaoColuna::Cor(i, Alvo::Texto, Some(Rgb(0, 0, 128))));
+        let salvo = serde_json::to_value(&c).unwrap();
+        assert_eq!(salvo["cores"], serde_json::json!([["Estoque", {"fundo": "#FFEEAA", "texto": "#000080"}]]));
+        let lida = ConfigColunas::<ColunaProd>::do_servidor(salvo);
+        assert_eq!(lida.cor_de(ColunaProd::Estoque).fundo, Some(Rgb(255, 238, 170)));
+
+        // "Restaurar padrão" não apaga as cores; "Padrão" de cada cor, sim.
+        c.aplicar(AcaoColuna::Padrao);
+        assert!(!c.cor_de(ColunaProd::Estoque).padrao());
+        let i = c.colunas.iter().position(|(c, _)| *c == ColunaProd::Estoque).unwrap();
+        c.aplicar(AcaoColuna::Cor(i, Alvo::Fundo, None));
+        c.aplicar(AcaoColuna::Cor(i, Alvo::Texto, None));
+        assert!(c.cores.is_empty());
+        assert!(serde_json::to_value(&c).unwrap().get("cores").is_none());
+    }
+
+    #[test]
+    fn cor_invalida_nao_perde_a_ordem() {
+        let salvo = serde_json::json!({"colunas": [["Tags", true]], "cores": [["Tags", {"fundo": "azul"}]]});
+        let c = ConfigColunas::<ColunaProd>::do_servidor(salvo);
+        assert_eq!(c.colunas[0], (ColunaProd::Tags, true));
+        assert!(c.cores.is_empty());
+        assert_eq!(Rgb::do_hex("#0a0B0c"), Some(Rgb(10, 11, 12)));
+        assert_eq!(Rgb::do_hex("#12345"), None);
+    }
+
+    #[test]
+    fn descreve_mudanca_de_cor() {
+        let antes = serde_json::json!({"colunas": [["Tags", true]]});
+        let depois = serde_json::json!({"colunas": [["Tags", true]], "cores": [["Tags", {"fundo": "#FFEEAA"}]]});
+        assert_eq!(descrever_mudanca("produtos", &antes, &depois), "Colunas de Produtos: mudou as cores de Tags");
     }
 
     #[test]

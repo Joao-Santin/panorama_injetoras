@@ -30,6 +30,7 @@ mod modelo;
 mod notificacoes;
 mod parcial;
 mod relatorio;
+mod seletor_cor;
 mod simulacao;
 mod trello;
 

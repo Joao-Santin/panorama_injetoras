@@ -8,7 +8,7 @@ anyhow = "1.0.104"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 dotenvy = "0.15.7"
 futures = { version = "0.3.34", default-features = false, features = ["std"] }
-iced = "0.14.0"
+iced = { version = "0.14.0", features = ["canvas"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "json", "native-tls"] }
 rust_xlsxwriter = "0.102.0"
 serde = { version = "1.0.229", features = ["derive"] }
