@@ -222,6 +222,8 @@ pub enum Message {
     Gravado(Result<Resposta, String>),
     Exportar,
     AbrirArquivo(PathBuf),
+    /// Abre um link no navegador (ex.: o cartão da OP no Trello).
+    AbrirLink(String),
     AlternarTema,
     Aba(Aba),
     BuscaNec(String),
@@ -611,6 +613,11 @@ impl App {
                         }
                         Err(e) => self.status = Some((true, format!("Erro ao gerar planilha: {e:#}"))),
                     }
+                }
+            }
+            Message::AbrirLink(url) => {
+                if let Err(e) = std::process::Command::new("explorer").arg(&url).spawn() {
+                    self.status = Some((true, format!("Não consegui abrir {url}: {e}")));
                 }
             }
             Message::AbrirArquivo(p) => {
@@ -1678,11 +1685,12 @@ impl App {
         let mut n = 0;
         for o in ops {
             let texto_busca = format!(
-                "{} {} {} {}",
+                "{} {} {} {} {}",
                 o.codigo,
                 o.tags.join(" "),
                 o.itens.iter().map(|i| i.descricao.as_str()).collect::<Vec<_>>().join(" "),
-                self.situacoes(o.codigo).iter().map(Situacao::texto).collect::<Vec<_>>().join(" ")
+                self.situacoes(o.codigo).iter().map(Situacao::texto).collect::<Vec<_>>().join(" "),
+                trello::etiquetas(self.situacoes(o.codigo)).iter().map(|e| e.nome.as_str()).collect::<Vec<_>>().join(" ")
             );
             let passa = match filtro {
                 Some(f) => f.aceita(self.situacoes(o.codigo)),
@@ -1702,6 +1710,12 @@ impl App {
             if falta {
                 linha2 = linha2.push(space::horizontal()).push(text("falta material").size(11).style(text::danger));
             }
+            let etiquetas = trello::etiquetas(self.situacoes(o.codigo));
+            let linha_etiquetas: Element<'a, Message> = if etiquetas.is_empty() {
+                space::vertical().height(0).into()
+            } else {
+                row(etiquetas.into_iter().map(|e| selo_etiqueta(e, 10))).spacing(4).wrap().into()
+            };
             let estilo: EstiloBotao = if self.op_sel == Some(o.codigo) { cartao_selecionado } else { cartao };
             lista = lista.push(
                 button(
@@ -1712,6 +1726,7 @@ impl App {
                             .push(text(format!("início {}", fmt::data(&o.dt_inicio))).size(11))
                             .spacing(6)
                             .align_y(Center),
+                        linha_etiquetas,
                         text(format!("{principal}{extra}")).size(12),
                         linha2,
                     ]
@@ -1781,6 +1796,26 @@ impl App {
         .into()
     }
 
+    /// Etiquetas dos cartões da OP e o botão de abrir cada cartão no Trello.
+    fn view_trello_op<'a>(&'a self, op: i64) -> Element<'a, Message> {
+        let situacoes = self.situacoes(op);
+        let mut r = row(trello::etiquetas(situacoes).into_iter().map(|e| selo_etiqueta(e, 12))).spacing(6).align_y(Center);
+        let mut urls: Vec<&Situacao> = Vec::new();
+        for s in situacoes.iter().filter(|s| !s.url.is_empty()) {
+            if !urls.iter().any(|u| u.url == s.url) {
+                urls.push(s);
+            }
+        }
+        r = r.push(space::horizontal());
+        for s in &urls {
+            let rotulo = if urls.len() > 1 { format!("Abrir no Trello ({})", s.texto()) } else { "Abrir no Trello".into() };
+            r = r.push(
+                button(text(rotulo).size(12)).padding([3, 10]).style(button::secondary).on_press(Message::AbrirLink(s.url.clone())),
+            );
+        }
+        r.into()
+    }
+
     fn view_detalhe_op<'a>(&'a self, a: &'a Analise, o: &'a Op) -> Element<'a, Message> {
         let no_grupo = self.grupo_ops.contains(&o.codigo);
         let estilo_grupo: EstiloBotao = if no_grupo { button::secondary } else { button::primary };
@@ -1807,6 +1842,7 @@ impl App {
                 )
                 .spacing(10)
                 .align_y(Center),
+            self.view_trello_op(o.codigo),
             text(o.tags.join("  ·  ")).size(13),
             text(format!(
                 "Cadastro {}  ·  início {}  ·  entrega {}  ·  {} itens  ·  {} peças  ·  {} kg  ·  {}",
@@ -2601,6 +2637,27 @@ fn selo_trello<'a>(s: &Situacao) -> Element<'a, Message> {
         Etapa::AguardandoBaixa => (iced::Color::from_rgb8(0xF9, 0xC8, 0x0E), iced::Color::BLACK),
     };
     container(text(s.texto()).size(11).font(NEGRITO))
+        .padding([1, 6])
+        .style(move |_: &Theme| container::Style {
+            background: Some(fundo.into()),
+            text_color: Some(letra),
+            border: iced::Border { radius: 4.0.into(), ..iced::Border::default() },
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// Etiqueta do cartão no Trello, com a cor dela. Sem nome, fica só a faixa colorida.
+fn selo_etiqueta<'a>(e: &trello::Etiqueta, tamanho: u32) -> Element<'a, Message> {
+    let (r, g, b) = e.rgb();
+    let fundo = iced::Color::from_rgb8(r, g, b);
+    let letra = if e.letra_clara() { iced::Color::WHITE } else { iced::Color::from_rgb8(0x17, 0x2B, 0x4D) };
+    let conteudo: Element<'a, Message> = if e.nome.is_empty() {
+        space::horizontal().width(tamanho as f32 * 2.5).height(tamanho as f32 + 2.0).into()
+    } else {
+        text(e.nome.clone()).size(tamanho).font(NEGRITO).into()
+    };
+    container(conteudo)
         .padding([1, 6])
         .style(move |_: &Theme| container::Style {
             background: Some(fundo.into()),

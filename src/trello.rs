@@ -37,11 +37,67 @@ impl Etapa {
     }
 }
 
+/// Etiqueta do cartão no Trello (ex.: "Urgente", vermelha). O nome pode ser vazio.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Etiqueta {
+    pub nome: String,
+    /// Cor do Trello: "red", "green_dark", "sky_light"... `None` = sem cor.
+    pub cor: Option<String>,
+}
+
+impl Etiqueta {
+    /// Cor RGB da etiqueta, a mesma paleta do Trello. Sem cor ou desconhecida = cinza.
+    pub fn rgb(&self) -> (u8, u8, u8) {
+        match self.cor.as_deref().unwrap_or("") {
+            "green_light" => (0xBA, 0xF3, 0xDB),
+            "green" => (0x4B, 0xCE, 0x97),
+            "green_dark" => (0x1F, 0x84, 0x5A),
+            "yellow_light" => (0xF8, 0xE6, 0xA0),
+            "yellow" => (0xF5, 0xCD, 0x47),
+            "yellow_dark" => (0x94, 0x6F, 0x00),
+            "orange_light" => (0xFE, 0xDE, 0xC8),
+            "orange" => (0xFE, 0xA3, 0x62),
+            "orange_dark" => (0xC2, 0x51, 0x00),
+            "red_light" => (0xFF, 0xD5, 0xD2),
+            "red" => (0xF8, 0x71, 0x68),
+            "red_dark" => (0xC9, 0x37, 0x2C),
+            "purple_light" => (0xDF, 0xD8, 0xFD),
+            "purple" => (0x9F, 0x8F, 0xEF),
+            "purple_dark" => (0x6E, 0x5D, 0xC6),
+            "blue_light" => (0xCC, 0xE0, 0xFF),
+            "blue" => (0x57, 0x9D, 0xFF),
+            "blue_dark" => (0x0C, 0x66, 0xE4),
+            "sky_light" => (0xC6, 0xED, 0xFB),
+            "sky" => (0x6C, 0xC3, 0xE0),
+            "sky_dark" => (0x22, 0x7D, 0x9B),
+            "lime_light" => (0xD3, 0xF1, 0xA7),
+            "lime" => (0x94, 0xC7, 0x48),
+            "lime_dark" => (0x5B, 0x7F, 0x24),
+            "pink_light" => (0xFD, 0xD0, 0xEC),
+            "pink" => (0xE7, 0x74, 0xBB),
+            "pink_dark" => (0xAE, 0x47, 0x87),
+            "black_light" => (0xDC, 0xDF, 0xE4),
+            "black" => (0x8C, 0x9B, 0xAB),
+            "black_dark" => (0x62, 0x6F, 0x86),
+            _ => (0xB3, 0xB9, 0xC4),
+        }
+    }
+
+    /// Letra escura nas cores claras e clara nas escuras.
+    pub fn letra_clara(&self) -> bool {
+        let (r, g, b) = self.rgb();
+        0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b) < 140.0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Situacao {
     pub etapa: Etapa,
     /// Só para cartões em andamento: separador "MAQUINA N" acima do cartão.
     pub maquina: Option<String>,
+    pub etiquetas: Vec<Etiqueta>,
+    /// Link do cartão no Trello (vazio se o servidor não mandou).
+    pub url: String,
 }
 
 impl Situacao {
@@ -56,6 +112,17 @@ impl Situacao {
 
 /// Situações de cada OP. Uma OP pode ter vários cartões (ex.: em duas máquinas).
 pub type Situacoes = HashMap<i64, Vec<Situacao>>;
+
+/// Etiquetas de todos os cartões da OP, sem repetir, na ordem em que aparecem.
+pub fn etiquetas(situacoes: &[Situacao]) -> Vec<&Etiqueta> {
+    let mut out: Vec<&Etiqueta> = Vec::new();
+    for e in situacoes.iter().flat_map(|s| &s.etiquetas) {
+        if !out.contains(&e) {
+            out.push(e);
+        }
+    }
+    out
+}
 
 /// Posição da OP na ordem "aguardando máquina → em máquina → aguardando baixa → sem cartão".
 /// Com vários cartões, vale a etapa mais cedo nessa ordem.
@@ -173,16 +240,28 @@ pub fn de_json(cartoes: &[Value]) -> Situacoes {
             Etapa::EmMaquina => c["maquina"].as_str().map(str::trim).filter(|m| !m.is_empty()).map(String::from),
             _ => None,
         };
+        // Servidor antigo não manda `etiquetas`: fica sem.
+        let etiquetas: Vec<Etiqueta> = c["etiquetas"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|e| Etiqueta {
+                nome: e["nome"].as_str().unwrap_or("").trim().to_string(),
+                cor: e["cor"].as_str().filter(|c| !c.is_empty()).map(String::from),
+            })
+            .filter(|e| !e.nome.is_empty() || e.cor.is_some())
+            .collect();
+        let url = c["url"].as_str().unwrap_or("").trim().to_string();
         for op in c["ops"].as_array().into_iter().flatten().filter_map(Value::as_i64) {
             let lista = mapa.entry(op).or_default();
-            let s = Situacao { etapa, maquina: maquina.clone() };
+            let s = Situacao { etapa, maquina: maquina.clone(), etiquetas: etiquetas.clone(), url: url.clone() };
             if !lista.contains(&s) {
                 lista.push(s);
             }
         }
     }
     for lista in mapa.values_mut() {
-        lista.sort_by(|a, b| a.etapa.cmp(&b.etapa).then_with(|| a.maquina.cmp(&b.maquina)));
+        lista.sort_by(|a, b| a.etapa.cmp(&b.etapa).then_with(|| a.maquina.cmp(&b.maquina)).then_with(|| a.url.cmp(&b.url)));
     }
     mapa
 }
@@ -207,7 +286,7 @@ mod testes {
             cartao(&[5], "outra-lista", None),
         ]);
 
-        assert_eq!(s[&1323], [Situacao { etapa: Etapa::AguardandoMaquina, maquina: None }]);
+        assert_eq!(s[&1323], [sit(Etapa::AguardandoMaquina, None)]);
         assert_eq!(s[&1046][0].texto(), "Em máquina · MAQUINA 9");
         assert_eq!(s[&981], s[&1046]);
         assert_eq!(s[&700][0].texto(), "Aguardando baixa", "máquina não vale fora de andamento");
@@ -216,7 +295,32 @@ mod testes {
     }
 
     fn sit(etapa: Etapa, maquina: Option<&str>) -> Situacao {
-        Situacao { etapa, maquina: maquina.map(String::from) }
+        Situacao { etapa, maquina: maquina.map(String::from), etiquetas: Vec::new(), url: String::new() }
+    }
+
+    #[test]
+    fn le_etiquetas_e_link_e_junta_sem_repetir() {
+        let mut c1 = cartao(&[10], "aguardando-maquina", None);
+        c1["url"] = json!("https://trello.com/c/abc");
+        c1["etiquetas"] = json!([{"nome": "Urgente", "cor": "red"}, {"nome": "", "cor": "green"}, {"nome": "", "cor": null}]);
+        let mut c2 = cartao(&[10], "em-andamento", Some("MAQUINA 2"));
+        c2["etiquetas"] = json!([{"nome": "Urgente", "cor": "red"}, {"nome": "Cliente X", "cor": null}]);
+        let s = de_json(&[c1, c2, cartao(&[20], "concluido", None)]);
+
+        let aguardando = s[&10].iter().find(|x| x.etapa == Etapa::AguardandoMaquina).unwrap();
+        assert_eq!(aguardando.url, "https://trello.com/c/abc");
+        assert_eq!(aguardando.etiquetas.len(), 2, "etiqueta sem nome e sem cor é descartada");
+        let nomes: Vec<&str> = etiquetas(&s[&10]).iter().map(|e| e.nome.as_str()).collect();
+        assert_eq!(nomes, ["Urgente", "Cliente X", ""], "na ordem dos cartões: em máquina antes de aguardando");
+        assert!(s[&20][0].etiquetas.is_empty(), "servidor antigo, sem o campo");
+    }
+
+    #[test]
+    fn cor_da_letra_acompanha_o_fundo() {
+        let e = |c: &str| Etiqueta { nome: "x".into(), cor: Some(c.into()) };
+        assert!(e("red_dark").letra_clara());
+        assert!(!e("yellow_light").letra_clara());
+        assert_eq!(Etiqueta { nome: "x".into(), cor: None }.rgb(), e("inexistente").rgb());
     }
 
     #[test]
