@@ -1,14 +1,13 @@
 //! Situação das OPs no quadro "Programação Máquinas" do Trello, lida do
-//! servidor `biplas_server_claude` (rota `/api/trello/ops`). Só informa: nada aqui
-//! altera o levantamento.
+//! servidor `biplas_server_claude` (rota `/api/trello/ops`, servida do banco: quem
+//! busca no Trello é o servidor). Só informa: nada aqui altera o levantamento.
 
 use std::{collections::HashMap, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
-/// A primeira chamada do servidor baixa todo o histórico do quadro (~15 s).
-const TEMPO_LIMITE: Duration = Duration::from_secs(90);
+const TEMPO_LIMITE: Duration = Duration::from_secs(30);
 
 /// Em que lista do quadro o cartão da OP está. A ordem é a de exibição.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -151,7 +150,7 @@ impl FiltroSituacao {
 /// `raiz` é o endereço do servidor (ex.: `http://localhost:3000`).
 pub fn buscar(raiz: &str) -> Result<Situacoes> {
     let url = format!("{}/api/trello/ops", raiz.trim_end_matches('/'));
-    let http = crate::api::cliente_http(TEMPO_LIMITE)?;
+    let http = crate::api::cliente_http(Some(TEMPO_LIMITE))?;
     let resp = http
         .get(&url)
         .send()

@@ -1,18 +1,15 @@
 //! Colunas configuráveis das tabelas (quais aparecem e em que ordem).
-//! Cada tabela salva a própria configuração em `relatorios/`.
-
-use std::path::PathBuf;
+//! A configuração de cada tabela fica no banco do servidor e vale para todos
+//! os computadores.
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-
-use crate::coleta;
 
 /// Uma coluna de uma tabela configurável.
 pub trait Coluna: Copy + PartialEq + Serialize + DeserializeOwned + 'static {
     /// Ordem padrão, com a visibilidade padrão de cada coluna.
     const PADRAO: &'static [(Self, bool)];
-    /// Nome do arquivo onde a configuração é salva.
-    const ARQUIVO: &'static str;
+    /// Nome da tabela no servidor (`/api/panorama/colunas/{TABELA}`).
+    const TABELA: &'static str;
 
     fn rotulo(self) -> &'static str;
 
@@ -75,7 +72,7 @@ impl Coluna for ColunaNec {
         (Self::NumProdutos, false),
         (Self::Tags, false),
     ];
-    const ARQUIVO: &'static str = "config_colunas_necessidades.json";
+    const TABELA: &'static str = "necessidades";
 
     fn rotulo(self) -> &'static str {
         match self {
@@ -147,7 +144,7 @@ impl Coluna for ColunaProd {
         (Self::PrecoVenda, true),
         (Self::Tags, true),
     ];
-    const ARQUIVO: &'static str = "config_colunas_produtos.json";
+    const TABELA: &'static str = "produtos";
 
     fn rotulo(self) -> &'static str {
         match self {
@@ -195,17 +192,11 @@ impl<C: Coluna> Default for ConfigColunas<C> {
     }
 }
 
-fn caminho<C: Coluna>() -> PathBuf {
-    coleta::pasta_saida().join(C::ARQUIVO)
-}
-
 impl<C: Coluna> ConfigColunas<C> {
-    /// Carrega do disco; se não existir/for inválido, usa o padrão.
-    pub fn carregar() -> Self {
-        let cfg: Self = std::fs::read(caminho::<C>())
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
+    /// A partir do que o servidor guardou (`null` se nunca foi configurada);
+    /// se não houver ou for inválido, usa o padrão.
+    pub fn do_servidor(salva: serde_json::Value) -> Self {
+        let cfg: Self = serde_json::from_value(salva).unwrap_or_default();
         cfg.normalizada()
     }
 
@@ -231,21 +222,14 @@ impl<C: Coluna> ConfigColunas<C> {
         self
     }
 
-    pub fn salvar(&self) -> anyhow::Result<()> {
-        std::fs::create_dir_all(coleta::pasta_saida())?;
-        std::fs::write(caminho::<C>(), serde_json::to_vec_pretty(self)?)?;
-        Ok(())
-    }
-
-    /// Aplica a mudança e salva no disco.
-    pub fn aplicar(&mut self, acao: AcaoColuna) -> anyhow::Result<()> {
+    /// Aplica a mudança (quem chama envia a nova configuração ao servidor).
+    pub fn aplicar(&mut self, acao: AcaoColuna) {
         match acao {
             AcaoColuna::Visivel(i, v) => self.definir_visivel(i, v),
             AcaoColuna::Mover(i, destino) => self.mover(i, destino),
             AcaoColuna::MostrarTodas => self.mostrar_todas(),
             AcaoColuna::Padrao => *self = Self::default(),
         }
-        self.salvar()
     }
 
     pub fn visiveis(&self) -> impl Iterator<Item = C> + '_ {
@@ -314,9 +298,17 @@ mod testes {
     }
 
     #[test]
-    fn formato_do_arquivo_salvo_nao_mudou() {
-        let salvo = r#"{"colunas":[["Material",true],["Tags",false]]}"#;
-        let c: ConfigColunas<ColunaNec> = serde_json::from_str(salvo).unwrap();
+    fn formato_guardado_no_servidor_nao_mudou() {
+        let salvo = serde_json::json!({"colunas": [["Material", true], ["Tags", false]]});
+        let c: ConfigColunas<ColunaNec> = serde_json::from_value(salvo.clone()).unwrap();
         assert_eq!(c.colunas, [(ColunaNec::Material, true), (ColunaNec::Tags, false)]);
+        assert_eq!(serde_json::to_value(&c).unwrap(), salvo);
+    }
+
+    #[test]
+    fn sem_configuracao_no_servidor_usa_o_padrao() {
+        assert_eq!(ConfigColunas::<ColunaProd>::do_servidor(serde_json::Value::Null), ConfigColunas::default());
+        let invalida = serde_json::json!({"colunas": [["NaoExiste", true]]});
+        assert_eq!(ConfigColunas::<ColunaProd>::do_servidor(invalida), ConfigColunas::default());
     }
 }

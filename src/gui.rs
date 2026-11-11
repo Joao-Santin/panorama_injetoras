@@ -3,14 +3,15 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, mpsc},
 };
 
+use futures::channel::oneshot;
 use iced::{
     Alignment::Center,
     Element, Font,
     Length::{Fill, FillPortion},
-    Task, Theme, font,
+    Subscription, Task, Theme, font,
     alignment::Horizontal::Right,
     widget::{
         Column, button, center, checkbox, column, container, operation, pick_list, progress_bar, row, rule, scrollable,
@@ -19,12 +20,14 @@ use iced::{
 };
 
 use crate::{
+    api::{self, Servidor},
     calculo::{self, Alerta, Necessidade, Resultado},
     coleta::{self, Analise, DadosBrutos, Progresso},
     colunas::{AcaoColuna, Coluna, ColunaNec, ColunaProd, ConfigColunas},
     estrutura::{self, Estrutura, MaterialSomado, No, TipoNo},
     fmt,
     modelo::{ItemComposicao, ItemOp, Op, Produto},
+    notificacoes::{self, Aviso, EstadoSync},
     parcial::{self, Lancamento},
     simulacao::{self, Simulacao, Simulado},
     trello::{self, Etapa, Situacao, Situacoes},
@@ -47,6 +50,7 @@ pub fn executar() -> iced::Result {
     iced::application(App::boot, App::update, App::view)
         .title(App::titulo)
         .theme(App::tema)
+        .subscription(App::subscription)
         .window_size((1400.0, 820.0))
         .run()
 }
@@ -175,18 +179,45 @@ impl std::fmt::Display for OpcaoOp {
     }
 }
 
+/// Dados próprios do panorama recarregados do servidor.
 #[derive(Debug, Clone)]
-pub enum Evento {
-    Progresso(Progresso),
-    Fim(Result<Arc<DadosBrutos>, String>),
+pub enum Recarga {
+    Colunas(ConfigColunas<ColunaNec>, ConfigColunas<ColunaProd>),
+    Simulacoes(Vec<Simulacao>),
+    Parciais(Vec<Lancamento>),
 }
+
+/// Gravação no servidor. Vão todas pela mesma thread, uma de cada vez e na ordem
+/// em que foram feitas (ex.: "1" e depois "12" no realizado termina em 12).
+#[derive(Debug)]
+pub enum Pedido {
+    Colunas(&'static str, serde_json::Value),
+    CriarSimulacao { cod_produto: i64, quantidade: f64 },
+    ExcluirSimulacao(u64),
+    /// `None` apaga o lançamento.
+    Parcial(parcial::Chave, Option<f64>),
+}
+
+#[derive(Debug, Clone)]
+pub enum Resposta {
+    Nada,
+    /// A lista atualizada, com o id da simulação criada.
+    Simulacoes { criada: Option<u64>, lista: Vec<Simulacao> },
+}
+
+type Envio = (Pedido, oneshot::Sender<Result<Resposta, String>>);
 
 #[derive(Debug, Clone)]
 pub enum Message {
     Atualizar,
     AtualizarTrello,
+    /// Resposta ao pedido de sincronização feito ao servidor.
+    PedidoSync(&'static str, Result<(), String>),
+    Aviso(Aviso),
+    Egestor(Result<Option<Arc<DadosBrutos>>, String>),
     Trello(Result<Arc<Situacoes>, String>),
-    Coleta(Evento),
+    Recarga(Result<Recarga, String>),
+    Gravado(Result<Resposta, String>),
     Exportar,
     AbrirArquivo(PathBuf),
     AlternarTema,
@@ -252,7 +283,13 @@ impl Paginacao {
 
 pub struct App {
     analise: Option<Analise>,
+    /// Andamento da sincronização do eGestor no servidor (vale para todos os panoramas abertos).
     coletando: Option<Progresso>,
+    /// Conectado aos avisos do servidor.
+    conectado: bool,
+    /// O servidor ainda não terminou nenhuma sincronização do eGestor.
+    servidor_sem_dados: bool,
+    gravador: mpsc::Sender<Envio>,
     status: Option<(bool, String)>,
     ultimo_excel: Option<PathBuf>,
     escuro: bool,
@@ -303,29 +340,100 @@ pub struct App {
     qtd_pecas: String,
 }
 
-fn iniciar_coleta() -> Task<Message> {
-    let (tx, rx) = futures::channel::mpsc::unbounded();
+/// Roda `f` numa thread (as chamadas ao servidor bloqueiam) e entrega o resultado em `msg`.
+fn em_segundo_plano<T: Send + 'static>(
+    f: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+    msg: fn(Result<T, String>) -> Message,
+) -> Task<Message> {
+    let (tx, rx) = oneshot::channel();
     std::thread::spawn(move || {
-        let tx_prog = tx.clone();
-        let r = coleta::coletar(&crate::api::url_servidor(), &mut |p| {
-            let _ = tx_prog.unbounded_send(Evento::Progresso(p));
-        })
-        .and_then(|b| {
-            coleta::salvar_cache(&b)?;
-            Ok(b)
-        });
-        let _ = tx.unbounded_send(Evento::Fim(r.map(Arc::new).map_err(|e| format!("{e:#}"))));
+        let _ = tx.send(f().map_err(|e| format!("{e:#}")));
     });
-    Task::run(rx, Message::Coleta)
+    Task::perform(rx, move |r| msg(r.unwrap_or_else(|_| Err("a tarefa foi interrompida".into()))))
 }
 
-/// Busca a situação das OPs no Trello numa thread, sem travar a interface.
-fn iniciar_trello() -> Task<Message> {
-    let (tx, rx) = futures::channel::oneshot::channel();
+/// Dados do eGestor guardados no servidor.
+fn carregar_egestor() -> Task<Message> {
+    em_segundo_plano(|| Ok(coleta::carregar(&Servidor::new()?)?.map(Arc::new)), Message::Egestor)
+}
+
+/// Situação das OPs no Trello guardada no servidor.
+fn carregar_trello() -> Task<Message> {
+    em_segundo_plano(|| Ok(Arc::new(trello::buscar(&api::url_servidor())?)), Message::Trello)
+}
+
+fn carregar_colunas() -> Task<Message> {
+    fn ler<C: Coluna>(srv: &Servidor) -> anyhow::Result<ConfigColunas<C>> {
+        Ok(ConfigColunas::do_servidor(srv.get(&format!("/api/panorama/colunas/{}", C::TABELA))?))
+    }
+    em_segundo_plano(
+        || {
+            let srv = Servidor::new()?;
+            Ok(Recarga::Colunas(ler(&srv)?, ler(&srv)?))
+        },
+        Message::Recarga,
+    )
+}
+
+fn carregar_simulacoes() -> Task<Message> {
+    em_segundo_plano(|| Ok(Recarga::Simulacoes(Servidor::new()?.get("/api/panorama/simulacoes")?)), Message::Recarga)
+}
+
+fn carregar_parciais() -> Task<Message> {
+    em_segundo_plano(|| Ok(Recarga::Parciais(Servidor::new()?.get("/api/panorama/parciais")?)), Message::Recarga)
+}
+
+/// Pede ao servidor para buscar de novo no eGestor ou no Trello.
+fn pedir_sync(fonte: &'static str) -> Task<Message> {
+    let (tx, rx) = oneshot::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(trello::buscar(&crate::api::url_servidor()).map(Arc::new).map_err(|e| format!("{e:#}")));
+        let r = Servidor::new().and_then(|s| coleta::pedir_atualizacao(&s, fonte));
+        let _ = tx.send(r.map_err(|e| format!("{e:#}")));
     });
-    Task::perform(rx, |r| Message::Trello(r.unwrap_or_else(|_| Err("a busca no Trello foi interrompida".into()))))
+    Task::perform(rx, move |r| Message::PedidoSync(fonte, r.unwrap_or_else(|_| Err("o pedido foi interrompido".into()))))
+}
+
+/// Thread que faz as gravações no servidor, uma de cada vez, na ordem de chegada.
+fn iniciar_gravador() -> mpsc::Sender<Envio> {
+    let (tx, rx) = mpsc::channel::<Envio>();
+    std::thread::spawn(move || {
+        let srv = Servidor::new();
+        for (pedido, resposta) in rx {
+            let r = match &srv {
+                Ok(s) => gravar_no_servidor(s, pedido).map_err(|e| format!("{e:#}")),
+                Err(e) => Err(format!("{e:#}")),
+            };
+            let _ = resposta.send(r);
+        }
+    });
+    tx
+}
+
+fn gravar_no_servidor(srv: &Servidor, pedido: Pedido) -> anyhow::Result<Resposta> {
+    use reqwest::Method;
+    let nada = None::<&()>;
+    match pedido {
+        Pedido::Colunas(tabela, config) => {
+            srv.enviar(Method::PUT, &format!("/api/panorama/colunas/{tabela}"), Some(&config))?;
+        }
+        Pedido::CriarSimulacao { cod_produto, quantidade } => {
+            let corpo = serde_json::json!({ "cod_produto": cod_produto, "quantidade": quantidade });
+            let criada = srv.enviar(Method::POST, "/api/panorama/simulacoes", Some(&corpo))?;
+            let criada = criada.and_then(|v| v["id"].as_u64());
+            return Ok(Resposta::Simulacoes { criada, lista: srv.get("/api/panorama/simulacoes")? });
+        }
+        Pedido::ExcluirSimulacao(id) => {
+            srv.enviar(Method::DELETE, &format!("/api/panorama/simulacoes/{id}"), nada)?;
+        }
+        Pedido::Parcial((op, linha, cod_produto), Some(realizado)) => {
+            let corpo = Lancamento { op, linha, cod_produto, realizado };
+            srv.enviar(Method::PUT, "/api/panorama/parciais", Some(&corpo))?;
+        }
+        Pedido::Parcial(chave, None) => {
+            srv.enviar(Method::DELETE, &parcial::caminho(chave), nada)?;
+        }
+    }
+    Ok(Resposta::Nada)
 }
 
 fn contem(alvo: &str, busca: &str) -> bool {
@@ -333,25 +441,25 @@ fn contem(alvo: &str, busca: &str) -> bool {
 }
 
 impl App {
+    /// Começa vazio: os dados chegam quando a conexão com o servidor abre (`Aviso::Conectado`).
     fn boot() -> (Self, Task<Message>) {
-        let cache = coleta::carregar_cache();
-        let sem_cache = cache.is_none();
-        let lancamentos = parcial::carregar();
-        let mut app = Self {
-            analise: cache.as_ref().map(Analise::de),
-            coletando: sem_cache.then(|| Progresso { etapa: "Iniciando...".into(), fracao: 0.0 }),
-            status: (!sem_cache)
-                .then(|| (false, "Dados carregados do cache local. Clique em \"Atualizar do eGestor\" para buscar os atuais.".into())),
+        let app = Self {
+            analise: None,
+            coletando: None,
+            conectado: false,
+            servidor_sem_dados: false,
+            gravador: iniciar_gravador(),
+            status: None,
             ultimo_excel: None,
             escuro: true,
             aba: Aba::Resumo,
             busca_nec: String::new(),
             so_faltas: false,
             ordem_nec: OrdemNec::CustoFalta,
-            config_nec: ConfigColunas::carregar(),
+            config_nec: ConfigColunas::default(),
             modo_config_nec: false,
             modo_simulacoes: false,
-            simulacoes: simulacao::carregar(),
+            simulacoes: Vec::new(),
             simulado: Simulado::default(),
             busca_sim: String::new(),
             sim_item: None,
@@ -365,25 +473,27 @@ impl App {
             so_ops_falta: false,
             ordem_op: OrdemOp::Numero,
             trello: Arc::default(),
-            buscando_trello: true,
+            buscando_trello: false,
             status_trello: None,
             op_sel: None,
-            textos_realizado: parcial::textos(&lancamentos),
+            textos_realizado: HashMap::new(),
             produzido_parcial: HashMap::new(),
-            lancamentos,
+            lancamentos: Vec::new(),
             filtro_grav: FiltroGrav::Todas,
             busca_prod: String::new(),
             so_usados: false,
-            config_prod: ConfigColunas::carregar(),
+            config_prod: ConfigColunas::default(),
             modo_config_prod: false,
             produto_sel: None,
             pagina_prod: 0,
             visao_composicao: VisaoComposicao::Direta,
             qtd_pecas: QTD_PECAS_PADRAO.into(),
         };
-        app.recalcular_simulacoes();
-        let coleta = if sem_cache { iniciar_coleta() } else { Task::none() };
-        (app, Task::batch([coleta, iniciar_trello()]))
+        (app, Task::none())
+    }
+
+    fn subscription(&self) -> Subscription<Message> {
+        Subscription::run(notificacoes::fluxo).map(Message::Aviso)
     }
 
     fn titulo(&self) -> String {
@@ -399,14 +509,45 @@ impl App {
 
     fn update(&mut self, msg: Message) -> Task<Message> {
         match msg {
+            // Quem busca é o servidor: aqui só se pede. O andamento chega pelos avisos,
+            // e todos os panoramas abertos recarregam quando ele termina.
             Message::Atualizar => {
                 if self.coletando.is_none() {
-                    self.coletando = Some(Progresso { etapa: "Iniciando...".into(), fracao: 0.0 });
+                    self.coletando = Some(Progresso { etapa: "Pedindo ao servidor...".into(), fracao: 0.0 });
                     self.status = None;
-                    return Task::batch([iniciar_coleta(), self.atualizar_trello()]);
+                    return Task::batch([pedir_sync("egestor"), self.atualizar_trello()]);
                 }
             }
             Message::AtualizarTrello => return self.atualizar_trello(),
+            Message::PedidoSync(_, Ok(())) => {}
+            Message::PedidoSync(fonte, Err(e)) => {
+                if fonte == "egestor" {
+                    self.coletando = None;
+                    self.status = Some((true, format!("Não consegui pedir a atualização do eGestor: {e}")));
+                } else {
+                    self.buscando_trello = false;
+                    self.status_trello = Some(Err(e));
+                }
+            }
+            Message::Aviso(aviso) => return self.aviso(aviso),
+            Message::Egestor(Ok(Some(b))) => {
+                self.servidor_sem_dados = false;
+                let a = Analise::de(&b);
+                self.status = Some((
+                    false,
+                    format!("Dados do eGestor de {}: {} OPs em aberto, {} produtos.", a.gerado_em, a.ops.len(), a.produtos.len()),
+                ));
+                if self.op_sel.is_some_and(|c| !a.ops.iter().any(|o| o.codigo == c)) {
+                    self.op_sel = None;
+                }
+                self.analise = Some(a);
+                // Mantém o grupo, descartando OPs que não estão mais em aberto.
+                let abertas: HashSet<i64> = self.analise.iter().flat_map(|a| &a.ops).map(|o| o.codigo).collect();
+                self.grupo_ops.retain(|c| abertas.contains(c));
+                self.recalcular_grupo();
+            }
+            Message::Egestor(Ok(None)) => self.servidor_sem_dados = true,
+            Message::Egestor(Err(e)) => self.status = Some((true, format!("Não consegui ler os dados do servidor: {e}"))),
             Message::Trello(r) => {
                 self.buscando_trello = false;
                 self.status_trello = Some(match r {
@@ -417,33 +558,37 @@ impl App {
                     Err(e) => Err(e),
                 });
             }
-            Message::Coleta(Evento::Progresso(p)) => self.coletando = Some(p),
-            Message::Coleta(Evento::Fim(Ok(b))) => {
-                self.coletando = None;
-                let a = Analise::de(&b);
-                let mut resumo = format!("Dados atualizados: {} OPs em aberto, {} produtos.", a.ops.len(), a.produtos.len());
-                // O lançamento parcial só vale enquanto a OP está aberta.
-                let descartados = parcial::manter_validos(&mut self.lancamentos, &a.ops);
-                self.textos_realizado = parcial::textos(&self.lancamentos);
-                if descartados > 0 {
-                    resumo.push_str(&format!(" {descartados} lançamento(s) parcial(is) descartado(s): a OP não está mais aberta ou o item mudou."));
+            Message::Recarga(Ok(r)) => match r {
+                Recarga::Colunas(nec, prod) => {
+                    self.config_nec = nec;
+                    self.config_prod = prod;
                 }
-                self.status = Some((false, resumo));
-                if descartados > 0 {
-                    self.salvar_lancamentos();
+                Recarga::Simulacoes(lista) => {
+                    if self.sim_aberta.is_some_and(|id| !lista.iter().any(|s| s.id == id)) {
+                        self.sim_aberta = None;
+                    }
+                    self.simulacoes = lista;
+                    self.recalcular_simulacoes();
                 }
-                if self.op_sel.is_some_and(|c| !a.ops.iter().any(|o| o.codigo == c)) {
-                    self.op_sel = None;
+                Recarga::Parciais(lista) => {
+                    parcial::mesclar_textos(&mut self.textos_realizado, &lista);
+                    self.lancamentos = lista;
+                    self.recalcular_simulacoes();
                 }
-                self.analise = Some(a);
-                // Mantém o grupo, descartando OPs que não estão mais em aberto.
-                let abertas: HashSet<i64> = self.analise.iter().flat_map(|a| &a.ops).map(|o| o.codigo).collect();
-                self.grupo_ops.retain(|c| abertas.contains(c));
-                self.recalcular_grupo();
+            },
+            Message::Recarga(Err(e)) => self.status = Some((true, format!("Não consegui ler os dados do servidor: {e}"))),
+            Message::Gravado(Ok(Resposta::Nada)) => {}
+            Message::Gravado(Ok(Resposta::Simulacoes { criada, lista })) => {
+                self.simulacoes = lista;
+                if criada.is_some() {
+                    self.sim_aberta = criada;
+                }
+                self.recalcular_simulacoes();
             }
-            Message::Coleta(Evento::Fim(Err(e))) => {
-                self.coletando = None;
-                self.status = Some((true, format!("Falha na coleta: {e}")));
+            Message::Gravado(Err(e)) => {
+                self.status = Some((true, format!("Não consegui gravar no servidor: {e}")));
+                // Volta a mostrar o que de fato está gravado.
+                return Task::batch([carregar_colunas(), carregar_simulacoes(), carregar_parciais()]);
             }
             Message::Exportar => {
                 if let Some(a) = &self.analise {
@@ -488,14 +633,12 @@ impl App {
             }
             Message::SimQtd(s) => self.qtd_sim = s,
             Message::SimCriar => {
+                // O id vem do servidor: a simulação aparece quando ele responde.
                 if let (Some(cod_produto), Some(quantidade)) = (self.sim_item, fmt::ler_qtd(&self.qtd_sim)) {
-                    let id = simulacao::proximo_id(&self.simulacoes);
-                    self.simulacoes.push(Simulacao { id, cod_produto, quantidade });
-                    self.sim_aberta = Some(id);
                     self.sim_item = None;
                     self.busca_sim.clear();
                     self.qtd_sim.clear();
-                    self.simulacoes_alteradas();
+                    return self.gravar(Pedido::CriarSimulacao { cod_produto, quantidade });
                 }
             }
             Message::SimVer(id) => {
@@ -506,7 +649,8 @@ impl App {
                 if self.sim_aberta == Some(id) {
                     self.sim_aberta = None;
                 }
-                self.simulacoes_alteradas();
+                self.recalcular_simulacoes();
+                return self.gravar(Pedido::ExcluirSimulacao(id));
             }
             Message::GrupoEntrada(s) => self.entrada_grupo = s,
             Message::GrupoAdicionarEntrada => {
@@ -550,13 +694,17 @@ impl App {
                 self.recalcular_grupo();
             }
             Message::Colunas(tabela, acao) => {
-                let salvo = match tabela {
-                    Tabela::Necessidades => self.config_nec.aplicar(acao),
-                    Tabela::Produtos => self.config_prod.aplicar(acao),
+                let pedido = match tabela {
+                    Tabela::Necessidades => {
+                        self.config_nec.aplicar(acao);
+                        Pedido::Colunas(ColunaNec::TABELA, serde_json::to_value(&self.config_nec).expect("serializável"))
+                    }
+                    Tabela::Produtos => {
+                        self.config_prod.aplicar(acao);
+                        Pedido::Colunas(ColunaProd::TABELA, serde_json::to_value(&self.config_prod).expect("serializável"))
+                    }
                 };
-                if let Err(e) = salvo {
-                    self.status = Some((true, format!("Não consegui salvar a configuração de colunas: {e:#}")));
-                }
+                return self.gravar(pedido);
             }
             Message::SelMaterial(c) => self.material_sel = Some(c),
             Message::FecharMaterial => self.material_sel = None,
@@ -573,11 +721,12 @@ impl App {
                 self.aba = Aba::Ops;
             }
             Message::Realizado(chave, s) => {
-                let mudou = parcial::definir(&mut self.lancamentos, chave, fmt::ler_qtd(&s));
+                let realizado = fmt::ler_qtd(&s);
+                let mudou = parcial::definir(&mut self.lancamentos, chave, realizado);
                 self.textos_realizado.insert(chave, s);
                 if mudou {
                     self.recalcular_simulacoes();
-                    self.salvar_lancamentos();
+                    return self.gravar(Pedido::Parcial(chave, realizado));
                 }
             }
             Message::FiltroGrav(f) => self.filtro_grav = f,
@@ -609,12 +758,76 @@ impl App {
         Task::none()
     }
 
+    /// Pede ao servidor para ler o Trello de novo; a situação nova chega pelos avisos.
     fn atualizar_trello(&mut self) -> Task<Message> {
         if self.buscando_trello {
             return Task::none();
         }
         self.buscando_trello = true;
-        iniciar_trello()
+        pedir_sync("trello")
+    }
+
+    /// Manda a gravação para a thread do gravador; a resposta volta em `Message::Gravado`.
+    fn gravar(&self, pedido: Pedido) -> Task<Message> {
+        let (tx, rx) = oneshot::channel();
+        if self.gravador.send((pedido, tx)).is_err() {
+            return Task::done(Message::Gravado(Err("a gravação no servidor parou; feche e abra o programa".into())));
+        }
+        Task::perform(rx, |r| Message::Gravado(r.unwrap_or_else(|_| Err("a gravação foi interrompida".into()))))
+    }
+
+    fn aviso(&mut self, aviso: Aviso) -> Task<Message> {
+        match aviso {
+            // Pode ter perdido avisos enquanto estava desconectado: recarrega tudo.
+            Aviso::Conectado => {
+                self.conectado = true;
+                if self.status.as_ref().is_some_and(|(erro, _)| *erro) {
+                    self.status = None;
+                }
+                self.buscando_trello = true;
+                Task::batch([carregar_egestor(), carregar_trello(), carregar_colunas(), carregar_simulacoes(), carregar_parciais()])
+            }
+            Aviso::Desconectado(e) => {
+                self.conectado = false;
+                self.coletando = None;
+                self.buscando_trello = false;
+                self.status = Some((true, format!("Sem conexão com o servidor; tentando de novo... ({e})")));
+                Task::none()
+            }
+            Aviso::Sync { fonte, estado, etapa, fracao, erro } => match (fonte.as_str(), estado) {
+                ("egestor", EstadoSync::Andamento) => {
+                    self.coletando = Some(Progresso { etapa, fracao });
+                    Task::none()
+                }
+                ("egestor", EstadoSync::Concluido) => {
+                    self.coletando = None;
+                    carregar_egestor()
+                }
+                ("egestor", EstadoSync::Erro) => {
+                    self.coletando = None;
+                    let e = erro.unwrap_or_default();
+                    self.status = Some((true, format!("O servidor não conseguiu atualizar do eGestor: {e}")));
+                    Task::none()
+                }
+                ("trello", EstadoSync::Andamento) => {
+                    self.buscando_trello = true;
+                    Task::none()
+                }
+                ("trello", EstadoSync::Concluido) => carregar_trello(),
+                ("trello", EstadoSync::Erro) => {
+                    self.buscando_trello = false;
+                    self.status_trello = Some(Err(erro.unwrap_or_default()));
+                    Task::none()
+                }
+                _ => Task::none(),
+            },
+            Aviso::Dados(recurso) => match recurso.as_str() {
+                "colunas" => carregar_colunas(),
+                "simulacoes" => carregar_simulacoes(),
+                "parciais" => carregar_parciais(),
+                _ => Task::none(),
+            },
+        }
     }
 
     /// Situações da OP no Trello (vazio = sem cartão nas 3 listas).
@@ -678,19 +891,6 @@ impl App {
             }
             None => Simulado::default(),
         };
-    }
-
-    fn salvar_lancamentos(&mut self) {
-        if let Err(e) = parcial::salvar(&self.lancamentos) {
-            self.status = Some((true, format!("Não consegui salvar os lançamentos parciais: {e:#}")));
-        }
-    }
-
-    fn simulacoes_alteradas(&mut self) {
-        self.recalcular_simulacoes();
-        if let Err(e) = simulacao::salvar(&self.simulacoes) {
-            self.status = Some((true, format!("Não consegui salvar as simulações: {e:#}")));
-        }
     }
 
     /// Resultado usado na aba Necessidades: do grupo, se houver, senão o geral.

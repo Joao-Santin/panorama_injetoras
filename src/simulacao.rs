@@ -11,32 +11,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     calculo::{Necessidade, eh_mao_de_obra},
-    coleta::{self, Analise},
+    coleta::Analise,
     modelo::{ItemComposicao, Produto},
 };
 
-const ARQUIVO: &str = "simulacoes.json";
-
+/// Uma simulação guardada no servidor (`/api/panorama/simulacoes`). O id é dado
+/// pelo servidor e cresce na ordem de criação, que é a ordem em que as
+/// simulações usam o estoque.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Simulacao {
     pub id: u64,
     pub cod_produto: i64,
     pub quantidade: f64,
-}
-
-/// Carrega do disco; se não existir ou for inválido, começa sem simulações.
-pub fn carregar() -> Vec<Simulacao> {
-    std::fs::read(coleta::pasta_saida().join(ARQUIVO)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
-}
-
-pub fn salvar(simulacoes: &[Simulacao]) -> anyhow::Result<()> {
-    std::fs::create_dir_all(coleta::pasta_saida())?;
-    std::fs::write(coleta::pasta_saida().join(ARQUIVO), serde_json::to_vec_pretty(simulacoes)?)?;
-    Ok(())
-}
-
-pub fn proximo_id(simulacoes: &[Simulacao]) -> u64 {
-    simulacoes.iter().map(|s| s.id + 1).max().unwrap_or(1)
 }
 
 /// Itens que podem ser simulados (têm composição), por código ou nome.
@@ -455,10 +441,7 @@ mod testes {
     }
 
     #[test]
-    fn ids_nao_se_repetem_e_arquivo_mantem_o_formato() {
-        assert_eq!(proximo_id(&[]), 1);
-        assert_eq!(proximo_id(&[sim(7, 1, 1.0), sim(3, 1, 1.0)]), 8);
-
+    fn formato_do_servidor() {
         let salvo = r#"[{"id":7,"cod_produto":1,"quantidade":2.5}]"#;
         let lista: Vec<Simulacao> = serde_json::from_str(salvo).unwrap();
         assert_eq!(lista, [sim(7, 1, 2.5)]);

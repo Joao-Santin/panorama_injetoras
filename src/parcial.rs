@@ -5,14 +5,15 @@
 //! Uma OP pode ter o mesmo produto em várias linhas, com quantidades e composições
 //! diferentes, e o eGestor não dá um código às linhas. Por isso o lançamento guarda a
 //! posição da linha e o produto: se a linha mudar de produto, ele deixa de valer.
+//!
+//! Os lançamentos ficam no servidor (`/api/panorama/parciais`), que também apaga os
+//! que deixaram de valer quando sincroniza o eGestor.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{calculo::Necessidade, coleta, modelo::Op};
-
-const ARQUIVO: &str = "lancamentos_parciais.json";
+use crate::{calculo::Necessidade, fmt, modelo::Op};
 
 /// (nº da OP, posição da linha na OP, código do produto)
 pub type Chave = (i64, usize, i64);
@@ -31,15 +32,9 @@ impl Lancamento {
     }
 }
 
-/// Carrega do disco; se não existir ou for inválido, começa sem lançamentos.
-pub fn carregar() -> Vec<Lancamento> {
-    std::fs::read(coleta::pasta_saida().join(ARQUIVO)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
-}
-
-pub fn salvar(lancamentos: &[Lancamento]) -> anyhow::Result<()> {
-    std::fs::create_dir_all(coleta::pasta_saida())?;
-    std::fs::write(coleta::pasta_saida().join(ARQUIVO), serde_json::to_vec_pretty(lancamentos)?)?;
-    Ok(())
+/// Caminho do lançamento no servidor, para apagar.
+pub fn caminho((op, linha, cod_produto): Chave) -> String {
+    format!("/api/panorama/parciais/{op}/{linha}/{cod_produto}")
 }
 
 /// Grava o realizado de uma linha (`None` apaga). Devolve se algo mudou.
@@ -66,15 +61,6 @@ pub fn definir(lancamentos: &mut Vec<Lancamento>, chave: Chave, realizado: Optio
 
 fn linhas_abertas(ops: &[Op]) -> impl Iterator<Item = (Chave, &crate::modelo::ItemOp)> {
     ops.iter().flat_map(|o| o.itens.iter().enumerate().map(move |(i, item)| ((o.codigo, i, item.cod_produto), item)))
-}
-
-/// Descarta os lançamentos de OPs que não estão mais abertas (ou de linhas que mudaram).
-/// Devolve quantos foram descartados.
-pub fn manter_validos(lancamentos: &mut Vec<Lancamento>, ops: &[Op]) -> usize {
-    let validas: HashSet<Chave> = linhas_abertas(ops).map(|(chave, _)| chave).collect();
-    let antes = lancamentos.len();
-    lancamentos.retain(|l| validas.contains(&l.chave()));
-    antes - lancamentos.len()
 }
 
 /// Consumo já realizado de cada insumo: realizado da linha × consumo por peça com perda.
@@ -117,12 +103,25 @@ pub fn textos(lancamentos: &[Lancamento]) -> HashMap<Chave, String> {
     lancamentos.iter().map(|l| (l.chave(), l.realizado.to_string().replace('.', ","))).collect()
 }
 
+/// Atualiza os campos com os lançamentos recebidos do servidor sem mexer no que
+/// já diz o mesmo número: quem está digitando "1," não vê o campo virar "1".
+pub fn mesclar_textos(textos: &mut HashMap<Chave, String>, lancamentos: &[Lancamento]) {
+    let novos = self::textos(lancamentos);
+    textos.retain(|chave, texto| novos.contains_key(chave) || fmt::ler_qtd(texto).is_none());
+    for (chave, novo) in novos {
+        let atual = textos.entry(chave).or_default();
+        if fmt::ler_qtd(atual) != fmt::ler_qtd(&novo) {
+            *atual = novo;
+        }
+    }
+}
+
 #[cfg(test)]
 mod testes {
     use serde_json::json;
 
     use super::*;
-    use crate::{calculo, fmt, modelo::Produto};
+    use crate::{calculo, modelo::Produto};
 
     /// `linhas`: (produto, quantidade, [(insumo, consumo por peça)]).
     fn op(codigo: i64, linhas: &[(i64, f64, &[(i64, f64)])]) -> Op {
@@ -192,12 +191,22 @@ mod testes {
     }
 
     #[test]
-    fn descarta_so_lancamentos_de_ops_que_sairam_das_abertas() {
-        let ops = [op(1, &[(10, 100.0, &[]), (11, 100.0, &[])])];
-        let mut lista = vec![lanc(1, 1, 11, 5.0), lanc(2, 0, 10, 5.0), lanc(1, 0, 77, 5.0)];
+    fn mesclar_mantem_o_que_esta_sendo_digitado_e_traz_o_que_mudou() {
+        let mut t: HashMap<Chave, String> = [
+            ((1, 0, 10), "1,".to_string()),  // digitando, mesmo número do servidor
+            ((1, 1, 10), "3".to_string()),   // outro computador mudou para 4
+            ((1, 2, 10), "7".to_string()),   // apagado em outro computador
+            ((1, 3, 10), "abc".to_string()), // inválido, nunca foi ao servidor
+        ]
+        .into();
+        mesclar_textos(&mut t, &[lanc(1, 0, 10, 1.0), lanc(1, 1, 10, 4.0), lanc(2, 0, 11, 2.5)]);
 
-        assert_eq!(manter_validos(&mut lista, &ops), 2);
-        assert_eq!(lista, [lanc(1, 1, 11, 5.0)]);
+        assert_eq!(t[&(1, 0, 10)], "1,");
+        assert_eq!(t[&(1, 1, 10)], "4");
+        assert!(!t.contains_key(&(1, 2, 10)));
+        assert_eq!(t[&(1, 3, 10)], "abc");
+        assert_eq!(t[&(2, 0, 11)], "2,5");
+        assert_eq!(t.len(), 4);
     }
 
     #[test]
@@ -239,7 +248,7 @@ mod testes {
     }
 
     #[test]
-    fn formato_do_arquivo_salvo() {
+    fn formato_do_servidor() {
         let salvo = r#"[{"op":888,"linha":2,"cod_produto":1543,"realizado":10.5}]"#;
         let lista: Vec<Lancamento> = serde_json::from_str(salvo).unwrap();
         assert_eq!(lista, [lanc(888, 2, 1543, 10.5)]);

@@ -1,15 +1,17 @@
-//! Panorama de injetados: coleta as OPs em aberto e o cadastro de produtos
-//! no eGestor (via servidor `biplas_server_claude`) e mostra o levantamento de
-//! necessidades de materiais.
+//! Panorama de injetados: mostra o levantamento de necessidades de materiais
+//! das OPs em aberto, com os dados do eGestor e do Trello que o servidor
+//! `biplas_server_claude` guarda no banco. Colunas, simulações e realizado
+//! parcial também ficam no servidor, e todos os panoramas abertos se
+//! atualizam juntos quando algo muda.
 //!
 //! Uso:
 //!   cargo run --release            → interface gráfica (iced)
-//!   cargo run --release -- --cli   → só coleta e gera a planilha Excel
+//!   cargo run --release -- --cli   → só lê os dados do servidor e gera a planilha Excel
 //!
 //! Variáveis de ambiente (opcionais; também lidas do `.env`, veja `.env.example`):
 //!   BIPLAS_SERVER_URL  endereço do servidor (padrão: http://localhost:3000)
 //!   BIPLAS_API_KEY     chave enviada em x-api-key, se o servidor exigir
-//!   SAIDA_DIR          pasta de planilhas/cache (padrão: ./relatorios)
+//!   SAIDA_DIR          pasta das planilhas (padrão: ./relatorios)
 //!
 //! O `.env` é procurado na pasta atual e nas acima dela; se não achar, na pasta
 //! do executável e nas acima. Variáveis já definidas no sistema têm prioridade.
@@ -22,6 +24,7 @@ mod estrutura;
 mod fmt;
 mod gui;
 mod modelo;
+mod notificacoes;
 mod parcial;
 mod relatorio;
 mod simulacao;
@@ -57,18 +60,12 @@ fn main() {
 }
 
 fn executar_cli() -> Result<()> {
-    let base = api::url_servidor();
-    println!("Servidor: {base}");
-    let mut ultima_etapa = String::new();
-    let brutos = coleta::coletar(&base, &mut |p| {
-        // Imprime só quando muda a "família" da etapa, para não poluir.
-        let familia: String = p.etapa.split_whitespace().take(3).collect::<Vec<_>>().join(" ");
-        if familia != ultima_etapa {
-            println!("  {:>3.0}%  {}", p.fracao * 100.0, p.etapa);
-            ultima_etapa = familia;
-        }
-    })?;
-    coleta::salvar_cache(&brutos)?;
+    let srv = api::Servidor::new()?;
+    println!("Servidor: {}", api::url_servidor());
+    let Some(brutos) = coleta::carregar(&srv)? else {
+        anyhow::bail!("O servidor ainda não terminou nenhuma sincronização do eGestor. Tente de novo em alguns minutos.");
+    };
+    println!("Dados do eGestor de {}", brutos.gerado_em);
     let a = coleta::Analise::de(&brutos);
     let caminho = a.exportar_excel()?;
     imprimir_resumo(&a);

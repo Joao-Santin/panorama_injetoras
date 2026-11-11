@@ -1,31 +1,31 @@
-//! Coleta dos dados no eGestor + análise. Usado tanto pela interface
+//! Dados do eGestor lidos do servidor + análise. Usado tanto pela interface
 //! gráfica quanto pelo modo linha de comando.
+//!
+//! Quem busca no eGestor é o servidor (sozinho, de tempos em tempos, ou quando
+//! um programa pede com `pedir_atualizacao`); aqui só se lê o que está gravado.
 
 use std::{collections::HashMap, path::PathBuf};
 
-use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use anyhow::Result;
+use reqwest::Method;
+use serde::Deserialize;
+use serde_json::Value;
 
 use crate::{
-    api::Api,
+    api::Servidor,
     calculo::{self, Resultado},
     modelo::{self, ItemComposicao, Op, Produto},
     relatorio::{self, Totais},
 };
 
-pub const SITUACAO_ABERTA: i64 = 10;
-
-/// Respostas cruas do eGestor (guardadas em cache para abrir o app rápido).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Dados do eGestor como o servidor guardou (o JSON de cada registro é o do eGestor).
+#[derive(Debug, Clone)]
 pub struct DadosBrutos {
     pub gerado_em: String,
     pub ops: Vec<Value>,
     pub produtos: Vec<Value>,
-    /// Relatório `composicoes`. `None` = cache antigo, coletado antes deste campo existir.
-    #[serde(default)]
+    /// Relatório `composicoes`. `None` = ainda não coletado.
     pub composicoes: Option<Vec<Value>>,
-    #[serde(default)]
     pub categorias: Vec<Value>,
 }
 
@@ -36,103 +36,46 @@ pub struct Progresso {
     pub fracao: f32,
 }
 
-fn prog(etapa: impl Into<String>, fracao: f32) -> Progresso {
-    Progresso { etapa: etapa.into(), fracao: fracao.clamp(0.0, 1.0) }
-}
-
 pub fn pasta_saida() -> PathBuf {
     PathBuf::from(std::env::var("SAIDA_DIR").unwrap_or_else(|_| "relatorios".into()))
 }
 
-fn caminho_cache() -> PathBuf {
-    pasta_saida().join("ultima_coleta.json")
+#[derive(Debug, Deserialize)]
+struct StatusFonte {
+    ultima_ok_em: Option<String>,
 }
 
-pub fn salvar_cache(d: &DadosBrutos) -> Result<()> {
-    std::fs::create_dir_all(pasta_saida())?;
-    std::fs::write(caminho_cache(), serde_json::to_vec(d)?)?;
+#[derive(Debug, Deserialize)]
+struct StatusSync {
+    egestor: StatusFonte,
+}
+
+/// "2026-11-10T18:34:39.7Z" → "10/11/2026 15:34" (hora local).
+fn data_local(iso: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(iso)
+        .map(|d| d.with_timezone(&chrono::Local).format("%d/%m/%Y %H:%M").to_string())
+        .unwrap_or_else(|_| iso.to_string())
+}
+
+/// Lê do servidor as OPs em aberto, o cadastro de produtos, as composições e as
+/// categorias. `None` = o servidor ainda não terminou nenhuma sincronização do eGestor.
+pub fn carregar(srv: &Servidor) -> Result<Option<DadosBrutos>> {
+    let status: StatusSync = srv.get("/api/sync")?;
+    let Some(quando) = status.egestor.ultima_ok_em else { return Ok(None) };
+    Ok(Some(DadosBrutos {
+        gerado_em: data_local(&quando),
+        ops: srv.get("/api/dados/egestor/producao?abertas=true")?,
+        produtos: srv.get("/api/dados/egestor/produtos")?,
+        composicoes: Some(srv.get("/api/dados/egestor/composicoes")?),
+        categorias: srv.get("/api/dados/egestor/categorias")?,
+    }))
+}
+
+/// Pede ao servidor para buscar de novo no eGestor (`"egestor"`) ou no Trello
+/// (`"trello"`). Responde na hora; o andamento chega pelos avisos do servidor.
+pub fn pedir_atualizacao(srv: &Servidor, fonte: &str) -> Result<()> {
+    srv.enviar(Method::POST, &format!("/api/sync/{fonte}"), None::<&()>)?;
     Ok(())
-}
-
-pub fn carregar_cache() -> Option<DadosBrutos> {
-    let bytes = std::fs::read(caminho_cache()).ok()?;
-    serde_json::from_slice(&bytes).ok()
-}
-
-/// Busca OPs em aberto (com composição) e o cadastro completo de produtos.
-/// `raiz` é o endereço do servidor (ex.: `http://localhost:3000`).
-pub fn coletar(raiz: &str, progresso: &mut dyn FnMut(Progresso)) -> Result<DadosBrutos> {
-    let mut api = Api::new(raiz)?;
-    progresso(prog("Conectando ao servidor...", 0.0));
-    api.health()?;
-
-    // Composições cadastradas e categorias: chamadas rápidas, feitas antes da parte demorada.
-    progresso(prog("Lendo composições cadastradas...", 0.0));
-    let filtros = json!({ "codProds": "", "categoria": "", "tags": "" });
-    let Value::Array(composicoes) = api.post("/relatorios/composicoes", &filtros)? else {
-        bail!("O relatório de composições não devolveu uma lista");
-    };
-    progresso(prog("Lendo categorias...", 0.0));
-    let categorias = api.get_todas_paginas("/categorias", &mut |_, _, _| {})?;
-
-    // 1) Lista de OPs em aberto (0% – 5%)
-    let lista = api.get_todas_paginas(&format!("/producao?situacao={SITUACAO_ABERTA}"), &mut |p, u, _| {
-        progresso(prog(format!("Listando OPs em aberto (página {p}/{u})"), 0.05 * p as f32 / u as f32))
-    })?;
-    let mut codigos: Vec<i64> = lista
-        .iter()
-        .filter(|o| o["situacao"].as_i64() == Some(SITUACAO_ABERTA))
-        .filter(|o| o["ativo"].as_i64().unwrap_or(1) == 1)
-        .filter_map(|o| o["codigo"].as_i64())
-        .collect();
-    codigos.sort_unstable();
-
-    // 2) Detalhe de cada OP (5% – 50%)
-    let mut ops = Vec::with_capacity(codigos.len());
-    let total = codigos.len().max(1);
-    for (i, cod) in codigos.iter().enumerate() {
-        progresso(prog(
-            format!("Lendo composição da OP {cod} ({}/{})", i + 1, codigos.len()),
-            0.05 + 0.45 * i as f32 / total as f32,
-        ));
-        ops.push(api.get(&format!("/producao/{cod}")).with_context(|| format!("OP {cod}"))?);
-    }
-
-    // 3) Cadastro de produtos (50% – 97%)
-    let mut produtos = api.get_todas_paginas("/produtos", &mut |p, u, n| {
-        progresso(prog(
-            format!("Lendo cadastro de produtos (página {p}/{u}, {n} produtos)"),
-            0.50 + 0.47 * p as f32 / u as f32,
-        ))
-    })?;
-
-    // 4) Insumos/produtos das OPs que não vieram na listagem (97% – 100%)
-    let conhecidos: std::collections::HashSet<i64> =
-        produtos.iter().filter_map(|p| p["codigo"].as_i64()).collect();
-    let mut faltantes: Vec<i64> = ops
-        .iter()
-        .filter_map(Op::from_json)
-        .flat_map(|o| o.itens)
-        .flat_map(|i| std::iter::once(i.cod_produto).chain(i.insumos.into_iter().map(|x| x.cod_insumo)))
-        .filter(|c| !conhecidos.contains(c))
-        .collect();
-    faltantes.sort_unstable();
-    faltantes.dedup();
-    for cod in faltantes {
-        progresso(prog(format!("Buscando produto {cod}"), 0.98));
-        if let Ok(v) = api.get(&format!("/produtos/{cod}")) {
-            produtos.push(v);
-        }
-    }
-
-    progresso(prog("Concluído", 1.0));
-    Ok(DadosBrutos {
-        gerado_em: chrono::Local::now().format("%d/%m/%Y %H:%M").to_string(),
-        ops,
-        produtos,
-        composicoes: Some(composicoes),
-        categorias,
-    })
 }
 
 /// Tudo que a interface/relatório precisa, já calculado.
