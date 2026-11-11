@@ -24,6 +24,7 @@ use crate::{
     calculo::{self, Alerta, Necessidade, Resultado},
     coleta::{self, Analise, DadosBrutos, Progresso},
     colunas::{AcaoColuna, Coluna, ColunaNec, ColunaProd, ConfigColunas},
+    config,
     estrutura::{self, Estrutura, MaterialSomado, No, TipoNo},
     fmt,
     modelo::{ItemComposicao, ItemOp, Op, Produto},
@@ -65,6 +66,7 @@ pub enum Aba {
     Ops,
     Alertas,
     Produtos,
+    Configuracoes,
 }
 
 /// O que o banner da aba Produtos mostra do item selecionado.
@@ -259,6 +261,9 @@ pub enum Message {
     PaginaProd(usize),
     VisaoComposicao(VisaoComposicao),
     QtdPecas(String),
+    ConfigUrl(String),
+    ConfigSalvar,
+    ConfigPadrao,
 }
 
 /// Recorte de uma lista em páginas de `ITENS_POR_PAGINA`.
@@ -338,6 +343,12 @@ pub struct App {
     visao_composicao: VisaoComposicao,
     /// Texto do campo de quantidade da composição, como foi digitado.
     qtd_pecas: String,
+    /// Endereço do servidor em uso. Mudar refaz a conexão dos avisos.
+    servidor: String,
+    /// Texto do campo de endereço na aba Configurações, como foi digitado.
+    cfg_url: String,
+    /// Resultado do último "Salvar" da aba Configurações (erro?, mensagem).
+    cfg_status: Option<(bool, String)>,
 }
 
 /// Roda `f` numa thread (as chamadas ao servidor bloqueiam) e entrega o resultado em `msg`.
@@ -397,12 +408,9 @@ fn pedir_sync(fonte: &'static str) -> Task<Message> {
 fn iniciar_gravador() -> mpsc::Sender<Envio> {
     let (tx, rx) = mpsc::channel::<Envio>();
     std::thread::spawn(move || {
-        let srv = Servidor::new();
         for (pedido, resposta) in rx {
-            let r = match &srv {
-                Ok(s) => gravar_no_servidor(s, pedido).map_err(|e| format!("{e:#}")),
-                Err(e) => Err(format!("{e:#}")),
-            };
+            // Um cliente por pedido: o endereço do servidor pode mudar nas Configurações.
+            let r = Servidor::new().and_then(|s| gravar_no_servidor(&s, pedido)).map_err(|e| format!("{e:#}"));
             let _ = resposta.send(r);
         }
     });
@@ -488,12 +496,15 @@ impl App {
             pagina_prod: 0,
             visao_composicao: VisaoComposicao::Direta,
             qtd_pecas: QTD_PECAS_PADRAO.into(),
+            servidor: api::url_servidor(),
+            cfg_url: config::atual().servidor_url.unwrap_or_default(),
+            cfg_status: None,
         };
         (app, Task::none())
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        Subscription::run(notificacoes::fluxo).map(Message::Aviso)
+        Subscription::run_with(self.servidor.clone(), notificacoes::fluxo).map(Message::Aviso)
     }
 
     fn titulo(&self) -> String {
@@ -754,6 +765,15 @@ impl App {
             Message::PaginaProd(p) => return self.ir_para_pagina_prod(p),
             Message::VisaoComposicao(v) => self.visao_composicao = v,
             Message::QtdPecas(s) => self.qtd_pecas = s,
+            Message::ConfigUrl(s) => {
+                self.cfg_url = s;
+                self.cfg_status = None;
+            }
+            Message::ConfigSalvar => self.salvar_config(),
+            Message::ConfigPadrao => {
+                self.cfg_url.clear();
+                self.salvar_config();
+            }
         }
         Task::none()
     }
@@ -774,6 +794,39 @@ impl App {
             return Task::done(Message::Gravado(Err("a gravação no servidor parou; feche e abra o programa".into())));
         }
         Task::perform(rx, |r| Message::Gravado(r.unwrap_or_else(|_| Err("a gravação foi interrompida".into()))))
+    }
+
+    /// Grava as configurações. Se o endereço do servidor mudou, descarta os dados
+    /// do servidor antigo; a nova conexão de avisos recarrega tudo ao abrir.
+    fn salvar_config(&mut self) {
+        let url = match config::normalizar_url(&self.cfg_url) {
+            Ok(u) => u,
+            Err(e) => {
+                self.cfg_status = Some((true, format!("Não salvei: {e}")));
+                return;
+            }
+        };
+        let mut nova = config::atual();
+        nova.servidor_url = url;
+        if let Err(e) = config::salvar(nova.clone()) {
+            self.cfg_status = Some((true, format!("Não salvei: {e:#}")));
+            return;
+        }
+        self.cfg_url = nova.servidor_url.unwrap_or_default();
+        let servidor = api::url_servidor();
+        if servidor == self.servidor {
+            self.cfg_status = Some((false, "Configurações salvas.".into()));
+            return;
+        }
+        self.servidor = servidor;
+        self.analise = None;
+        self.coletando = None;
+        self.conectado = false;
+        self.servidor_sem_dados = false;
+        self.buscando_trello = false;
+        self.status = None;
+        self.recalcular_grupo();
+        self.cfg_status = Some((false, format!("Configurações salvas. Conectando a {}...", self.servidor)));
     }
 
     fn aviso(&mut self, aviso: Aviso) -> Task<Message> {
@@ -902,6 +955,7 @@ impl App {
 
     fn view(&self) -> Element<'_, Message> {
         let corpo: Element<'_, Message> = match &self.analise {
+            _ if self.aba == Aba::Configuracoes => self.view_configuracoes(),
             None if self.coletando.is_some() => {
                 center(text("Coletando dados do eGestor... (leva cerca de 1 minuto por causa do limite da API)").size(16))
                     .into()
@@ -922,20 +976,20 @@ impl App {
                 Aba::Ops => self.view_ops(a),
                 Aba::Alertas => self.view_alertas(a),
                 Aba::Produtos => self.view_produtos(a),
+                Aba::Configuracoes => unreachable!("tratada acima"),
             },
         };
 
-        let mut tela = column![self.view_cabecalho()].spacing(10).padding(16);
-        if let Some(a) = &self.analise {
-            tela = tela.push(self.view_abas(a));
-        }
-        tela.push(rule::horizontal(1)).push(corpo).into()
+        column![self.view_cabecalho(), self.view_abas(self.analise.as_ref()), rule::horizontal(1), corpo]
+            .spacing(10)
+            .padding(16)
+            .into()
     }
 
     fn view_cabecalho(&self) -> Element<'_, Message> {
         let sub = match &self.analise {
-            Some(a) => format!("Dados coletados em {}  ·  servidor {}", a.gerado_em, crate::api::url_servidor()),
-            None => format!("Sem dados  ·  servidor {}", crate::api::url_servidor()),
+            Some(a) => format!("Dados coletados em {}  ·  servidor {}", a.gerado_em, self.servidor),
+            None => format!("Sem dados  ·  servidor {}", self.servidor),
         };
         let topo = row![
             column![
@@ -984,10 +1038,24 @@ impl App {
         col.into()
     }
 
-    fn view_abas(&self, a: &Analise) -> Element<'_, Message> {
+    /// Sem dados, só Resumo (a tela de "nenhum dado") e Configurações.
+    fn view_abas(&self, a: Option<&Analise>) -> Element<'_, Message> {
+        let abas = match a {
+            Some(a) => self.abas_com_dados(a),
+            None => vec![(Aba::Resumo, "Resumo".to_string())],
+        };
+        let mut r = row![].spacing(4);
+        for (aba, rotulo) in abas.into_iter().chain([(Aba::Configuracoes, "Configurações".to_string())]) {
+            let estilo: EstiloBotao = if self.aba == aba { button::primary } else { button::text };
+            r = r.push(button(text(rotulo).size(14)).padding([6, 14]).style(estilo).on_press(Message::Aba(aba)));
+        }
+        r.into()
+    }
+
+    fn abas_com_dados(&self, a: &Analise) -> Vec<(Aba, String)> {
         let n_falta = a.tot.materiais_em_falta;
         let n_alta = a.res.alertas.iter().filter(|x| x.gravidade == "ALTA").count();
-        let abas = [
+        vec![
             (Aba::Resumo, "Resumo".to_string()),
             (
                 Aba::Necessidades,
@@ -1014,13 +1082,52 @@ impl App {
                     (filtrados, total) => format!("Produtos ({filtrados} de {total})"),
                 },
             ),
-        ];
-        let mut r = row![].spacing(4);
-        for (aba, rotulo) in abas {
-            let estilo: EstiloBotao = if self.aba == aba { button::primary } else { button::text };
-            r = r.push(button(text(rotulo).size(14)).padding([6, 14]).style(estilo).on_press(Message::Aba(aba)));
+        ]
+    }
+
+    // -------------------------------------------------- Configurações ---
+
+    fn view_configuracoes(&self) -> Element<'_, Message> {
+        let digitado = config::normalizar_url(&self.cfg_url);
+        let mudou = digitado.as_ref().is_ok_and(|u| *u != config::atual().servidor_url);
+        let conexao = if self.conectado {
+            text(format!("Conectado a {}", self.servidor)).size(13).style(text::success)
+        } else {
+            text(format!("Sem conexão com {}", self.servidor)).size(13).style(text::danger)
+        };
+
+        let mut servidor = column![
+            text("Servidor").size(18).font(NEGRITO),
+            text("Endereço do biplas_server_claude, sem o /api. Ex.: http://192.168.0.10:3000").size(13).style(text::secondary),
+            row![
+                text_input(&format!("Vazio = {}", config::url_padrao()), &self.cfg_url)
+                    .on_input(Message::ConfigUrl)
+                    .on_submit(Message::ConfigSalvar)
+                    .width(420),
+                button("Salvar").style(button::primary).on_press_maybe(mudou.then_some(Message::ConfigSalvar)),
+                button("Usar padrão")
+                    .style(button::secondary)
+                    .on_press_maybe(config::atual().servidor_url.is_some().then_some(Message::ConfigPadrao)),
+            ]
+            .spacing(8)
+            .align_y(Center),
+            conexao,
+        ]
+        .spacing(8);
+        if let Err(e) = &digitado {
+            servidor = servidor.push(text(format!("Endereço inválido: {e}")).size(13).style(text::warning));
         }
-        r.into()
+        if let Some((erro, msg)) = &self.cfg_status {
+            let estilo: EstiloTexto = if *erro { text::danger } else { text::success };
+            servidor = servidor.push(text(msg.as_str()).size(13).style(estilo));
+        }
+
+        let rodape = text(format!("Configurações deste computador, guardadas em {}", config::caminho().display()))
+            .size(12)
+            .style(text::secondary);
+
+        scrollable(column![container(servidor).padding(16).style(container::rounded_box), rodape].spacing(16).max_width(900))
+            .into()
     }
 
     // --------------------------------------------------------- Resumo ---

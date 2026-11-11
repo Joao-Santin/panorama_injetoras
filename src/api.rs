@@ -11,12 +11,9 @@ use reqwest::{
 };
 use serde::{Serialize, de::DeserializeOwned};
 
-/// Endereço do servidor, sem o `/api` (variável `BIPLAS_SERVER_URL`).
+/// Endereço do servidor, sem o `/api` (aba Configurações, `BIPLAS_SERVER_URL` ou o padrão).
 pub fn url_servidor() -> String {
-    std::env::var("BIPLAS_SERVER_URL")
-        .unwrap_or_else(|_| "http://localhost:3000".into())
-        .trim_end_matches('/')
-        .to_string()
+    crate::config::url_servidor()
 }
 
 /// Identifica este programa aberto. O servidor devolve nos avisos de mudança,

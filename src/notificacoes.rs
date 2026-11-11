@@ -55,12 +55,15 @@ fn interpretar(dados: &str, eu: &str) -> Option<Aviso> {
     })
 }
 
-/// Fluxo de avisos para a `Subscription` da interface.
-pub fn fluxo() -> mpsc::UnboundedReceiver<Aviso> {
+/// Fluxo de avisos do servidor em `raiz` para a `Subscription` da interface.
+/// Trocar o endereço cria outro fluxo; este para quando a interface o solta.
+#[allow(clippy::ptr_arg)] // `Subscription::run_with` passa `&D`, e aqui D = String
+pub fn fluxo(raiz: &String) -> mpsc::UnboundedReceiver<Aviso> {
+    let raiz = raiz.clone();
     let (tx, rx) = mpsc::unbounded();
     std::thread::spawn(move || {
         loop {
-            if let Err(e) = escutar(&tx)
+            if let Err(e) = escutar(&raiz, &tx)
                 && tx.unbounded_send(Aviso::Desconectado(format!("{e:#}"))).is_err()
             {
                 return;
@@ -75,8 +78,7 @@ pub fn fluxo() -> mpsc::UnboundedReceiver<Aviso> {
 }
 
 /// Fica lendo os avisos até a conexão cair (erro) ou a interface fechar (Ok).
-fn escutar(tx: &mpsc::UnboundedSender<Aviso>) -> anyhow::Result<()> {
-    let raiz = crate::api::url_servidor();
+fn escutar(raiz: &str, tx: &mpsc::UnboundedSender<Aviso>) -> anyhow::Result<()> {
     let resp = crate::api::cliente_http(None)?
         .get(format!("{raiz}/api/notificacoes"))
         .send()

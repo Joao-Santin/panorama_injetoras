@@ -9,7 +9,8 @@
 //!   cargo run --release -- --cli   → só lê os dados do servidor e gera a planilha Excel
 //!
 //! Variáveis de ambiente (opcionais; também lidas do `.env`, veja `.env.example`):
-//!   BIPLAS_SERVER_URL  endereço do servidor (padrão: http://localhost:3000)
+//!   BIPLAS_SERVER_URL  endereço do servidor (padrão: http://localhost:3000); o definido na
+//!                      aba Configurações (em %APPDATA%\panorama_injetados) tem prioridade
 //!   BIPLAS_API_KEY     chave enviada em x-api-key, se o servidor exigir
 //!   SAIDA_DIR          pasta das planilhas (padrão: ./relatorios)
 //!
@@ -20,6 +21,7 @@ mod api;
 mod calculo;
 mod coleta;
 mod colunas;
+mod config;
 mod estrutura;
 mod fmt;
 mod gui;
