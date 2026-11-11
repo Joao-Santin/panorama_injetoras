@@ -84,7 +84,13 @@ pub fn descrever(r: &Registro, produtos: Option<&HashMap<i64, Produto>>) -> Stri
     match r.acao.as_str() {
         "parcial" => {
             let antes = qtd(&d["anterior"]);
-            let depois = if d["realizado"].is_null() { "apagado".to_string() } else { qtd(&d["realizado"]) };
+            let mut depois = if d["realizado"].is_null() { "apagado".to_string() } else { qtd(&d["realizado"]) };
+            let grupos: Vec<crate::parcial::Grupo> = serde_json::from_value(d["grupos"].clone()).unwrap_or_default();
+            if !grupos.is_empty() {
+                depois.push_str(&format!(" ({})", crate::parcial::composicao(&grupos)));
+            } else if let (Some(v), Some(q)) = (d["volumes"].as_f64(), d["qtd_volume"].as_f64()) {
+                depois.push_str(&format!(" ({}V×{})", fmt::qtd(v), fmt::qtd(q)));
+            }
             format!(
                 "Realizado parcial da OP {}, item {} ({}): {antes} → {depois}",
                 d["op"].as_i64().unwrap_or(0),
@@ -125,6 +131,17 @@ mod testes {
         assert_eq!(descrever(&p, None), "Realizado parcial da OP 1323, item 1 (produto 7): — → 12");
         let p = reg("parcial", json!({"op": 5, "linha": 2, "cod_produto": 7, "anterior": 3.0, "realizado": null}));
         assert!(descrever(&p, None).ends_with("3 → apagado"));
+        let p = reg(
+            "parcial",
+            json!({"op": 5, "linha": 0, "cod_produto": 7, "anterior": 4000.0, "realizado": 8500.0, "volumes": 17.0, "qtd_volume": 500.0}),
+        );
+        assert!(descrever(&p, None).ends_with("4.000 → 8.500 (17V×500)"), "{}", descrever(&p, None));
+        let p = reg(
+            "parcial",
+            json!({"op": 5, "linha": 0, "cod_produto": 7, "anterior": null, "realizado": 5000.0,
+                   "grupos": [{"volumes": 1.0, "qtd_volume": 2000.0}, {"volumes": 3.0, "qtd_volume": 1000.0}]}),
+        );
+        assert!(descrever(&p, None).ends_with("— → 5.000 (1V×2.000 + 3V×1.000)"), "{}", descrever(&p, None));
         assert_eq!(descrever(&reg("sync", json!({"fonte": "trello", "iniciada": true})), None), "Pediu atualização do Trello");
         assert!(descrever(&reg("sync", json!({"fonte": "egestor", "iniciada": false})), None).contains("já estava"));
         assert_eq!(

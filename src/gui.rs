@@ -30,7 +30,7 @@ use crate::{
     historico::{self, ClienteAtivo, Registro},
     modelo::{ItemComposicao, ItemOp, Op, Produto},
     notificacoes::{self, Aviso, EstadoSync},
-    parcial::{self, Lancamento},
+    parcial::{self, Campos, Confirmacao, Grupo, Lancamento},
     simulacao::{self, Simulacao, Simulado},
     trello::{self, Etapa, Situacao, Situacoes},
 };
@@ -198,12 +198,14 @@ pub enum Pedido {
     CriarSimulacao { cod_produto: i64, quantidade: f64 },
     ExcluirSimulacao(u64),
     /// `None` apaga o lançamento.
-    Parcial(parcial::Chave, Option<f64>),
+    Parcial(parcial::Chave, Vec<Grupo>),
 }
 
 #[derive(Debug, Clone)]
 pub enum Resposta {
     Nada,
+    /// Realizado da OP gravado: recarregar as confirmações dela.
+    Parcial(i64),
     /// A lista atualizada, com o id da simulação criada.
     Simulacoes { criada: Option<u64>, lista: Vec<Simulacao> },
 }
@@ -254,7 +256,13 @@ pub enum Message {
     OrdemOp(OrdemOp),
     SelOp(i64),
     VerOp(i64),
-    Realizado(parcial::Chave, String),
+    /// Campo de volumes do tipo de volume `usize` da linha.
+    VolTotal(parcial::Chave, usize, String),
+    VolQtd(parcial::Chave, usize, String),
+    VolAdicionar(parcial::Chave),
+    VolRemover(parcial::Chave, usize),
+    ConfirmarRealizado(parcial::Chave),
+    Confirmacoes(Result<(i64, Vec<Confirmacao>), String>),
     FiltroGrav(FiltroGrav),
     BuscaProd(String),
     SoUsados(bool),
@@ -386,8 +394,11 @@ pub struct App {
     status_trello: Option<Result<String, String>>,
     op_sel: Option<i64>,
     lancamentos: Vec<Lancamento>,
-    /// Texto dos campos de realizado, como foi digitado (pode estar incompleto ou inválido).
-    textos_realizado: HashMap<parcial::Chave, String>,
+    /// Campos de volumes que estão sendo editados (ainda sem confirmar). Os que não
+    /// estão aqui mostram o que está salvo.
+    campos_vol: HashMap<parcial::Chave, Campos>,
+    /// Confirmações de realizado da OP selecionada (nº da OP, lista).
+    confirmacoes: Option<(i64, Vec<Confirmacao>)>,
     /// Total lançado de cada produto, para a aba Produtos.
     produzido_parcial: HashMap<i64, f64>,
     filtro_grav: FiltroGrav,
@@ -516,12 +527,13 @@ fn gravar_no_servidor(srv: &Servidor, pedido: Pedido) -> anyhow::Result<Resposta
         Pedido::ExcluirSimulacao(id) => {
             srv.enviar(Method::DELETE, &format!("/api/panorama/simulacoes/{id}"), nada)?;
         }
-        Pedido::Parcial((op, linha, cod_produto), Some(realizado)) => {
-            let corpo = Lancamento { op, linha, cod_produto, realizado };
-            srv.enviar(Method::PUT, "/api/panorama/parciais", Some(&corpo))?;
-        }
-        Pedido::Parcial(chave, None) => {
+        Pedido::Parcial(chave, grupos) if grupos.is_empty() => {
             srv.enviar(Method::DELETE, &parcial::caminho(chave), nada)?;
+            return Ok(Resposta::Parcial(chave.0));
+        }
+        Pedido::Parcial(chave, grupos) => {
+            srv.enviar(Method::PUT, "/api/panorama/parciais", Some(&Lancamento::novo(chave, grupos)))?;
+            return Ok(Resposta::Parcial(chave.0));
         }
     }
     Ok(Resposta::Nada)
@@ -567,7 +579,8 @@ impl App {
             buscando_trello: false,
             status_trello: None,
             op_sel: None,
-            textos_realizado: HashMap::new(),
+            campos_vol: HashMap::new(),
+            confirmacoes: None,
             produzido_parcial: HashMap::new(),
             lancamentos: Vec::new(),
             filtro_grav: FiltroGrav::Todas,
@@ -679,13 +692,14 @@ impl App {
                     self.recalcular_simulacoes();
                 }
                 Recarga::Parciais(lista) => {
-                    parcial::mesclar_textos(&mut self.textos_realizado, &lista);
                     self.lancamentos = lista;
                     self.recalcular_simulacoes();
                 }
             },
             Message::Recarga(Err(e)) => self.status = Some((true, format!("Não consegui ler os dados do servidor: {e}"))),
             Message::Gravado(Ok(Resposta::Nada)) => {}
+            Message::Gravado(Ok(Resposta::Parcial(op))) if self.op_sel == Some(op) => return self.carregar_confirmacoes(),
+            Message::Gravado(Ok(Resposta::Parcial(_))) => {}
             Message::Gravado(Ok(Resposta::Simulacoes { criada, lista })) => {
                 self.simulacoes = lista;
                 if criada.is_some() {
@@ -831,20 +845,41 @@ impl App {
             Message::BuscaOp(s) => self.busca_op = s,
             Message::SoOpsComFalta(b) => self.so_ops_falta = b,
             Message::OrdemOp(o) => self.ordem_op = o,
-            Message::SelOp(c) => self.op_sel = Some(c),
+            Message::SelOp(c) => {
+                self.op_sel = Some(c);
+                return self.carregar_confirmacoes();
+            }
             Message::VerOp(c) => {
                 self.op_sel = Some(c);
                 self.aba = Aba::Ops;
+                return self.carregar_confirmacoes();
             }
-            Message::Realizado(chave, s) => {
-                let realizado = fmt::ler_qtd(&s);
-                let mudou = parcial::definir(&mut self.lancamentos, chave, realizado);
-                self.textos_realizado.insert(chave, s);
-                if mudou {
-                    self.recalcular_simulacoes();
-                    return self.gravar(Pedido::Parcial(chave, realizado));
+            Message::VolTotal(chave, i, s) => {
+                if let Some(g) = self.campos_editados(chave).grupos.get_mut(i) {
+                    g.volumes = s;
                 }
             }
+            Message::VolQtd(chave, i, s) => {
+                if let Some(g) = self.campos_editados(chave).grupos.get_mut(i) {
+                    g.qtd_volume = s;
+                }
+            }
+            Message::VolAdicionar(chave) => self.campos_editados(chave).adicionar(),
+            Message::VolRemover(chave, i) => self.campos_editados(chave).remover(i),
+            Message::ConfirmarRealizado(chave) => {
+                let Some(Ok(grupos)) = self.campos_vol.get(&chave).map(Campos::ler) else { return Task::none() };
+                self.campos_vol.remove(&chave);
+                if parcial::definir(&mut self.lancamentos, chave, grupos.clone()) {
+                    self.recalcular_simulacoes();
+                    return self.gravar(Pedido::Parcial(chave, grupos));
+                }
+            }
+            Message::Confirmacoes(Ok((op, lista))) => {
+                if self.op_sel == Some(op) {
+                    self.confirmacoes = Some((op, lista));
+                }
+            }
+            Message::Confirmacoes(Err(e)) => self.status = Some((true, format!("Não consegui ler o histórico do realizado: {e}"))),
             Message::FiltroGrav(f) => self.filtro_grav = f,
             Message::BuscaProd(s) => {
                 self.busca_prod = s;
@@ -926,6 +961,25 @@ impl App {
             Message::AtivosAtualizar => return carregar_ativos(),
         }
         Task::none()
+    }
+
+    /// Campos de volumes da linha para editar: começa do que está salvo.
+    fn campos_editados(&mut self, chave: parcial::Chave) -> &mut Campos {
+        let salvo = self.lancamento(chave).cloned();
+        self.campos_vol.entry(chave).or_insert_with(|| Campos::do_lancamento(salvo.as_ref()))
+    }
+
+    fn lancamento(&self, (op, linha, cod_produto): parcial::Chave) -> Option<&Lancamento> {
+        self.lancamentos.iter().find(|l| l.op == op && l.linha == linha && l.cod_produto == cod_produto)
+    }
+
+    /// Lê do servidor as confirmações de realizado da OP selecionada.
+    fn carregar_confirmacoes(&self) -> Task<Message> {
+        let Some(op) = self.op_sel else { return Task::none() };
+        em_segundo_plano(
+            move || Ok((op, Servidor::new()?.get(&format!("/api/panorama/parciais/lancamentos?op={op}"))?)),
+            Message::Confirmacoes,
+        )
     }
 
     /// Recarrega o histórico ou os usuários ativos, se estiverem na tela.
@@ -1081,7 +1135,7 @@ impl App {
             Aviso::Dados(recurso) => match recurso.as_str() {
                 "colunas" => carregar_colunas(),
                 "simulacoes" => carregar_simulacoes(),
-                "parciais" => carregar_parciais(),
+                "parciais" => Task::batch([carregar_parciais(), self.carregar_confirmacoes()]),
                 "historico" if self.aba == Aba::Configuracoes && self.cfg_sub == SubConfig::Historico => {
                     Task::batch([self.carregar_historico(false), carregar_usuarios_hist()])
                 }
@@ -2241,36 +2295,119 @@ impl App {
         scrollable(col.padding([0, 12])).height(Fill).into()
     }
 
-    /// Campo do realizado parcial de uma linha da OP, com o aviso sobre o valor digitado.
+    /// Realizado parcial da linha: um ou mais tipos de volume (volumes × quantidade por
+    /// volume), somados e gravados só ao confirmar. Embaixo, produzido × pedido e cada
+    /// confirmação com quanto entrou.
     fn view_realizado<'a>(&'a self, chave: parcial::Chave, quant: f64) -> Element<'a, Message> {
-        let digitado = self.textos_realizado.get(&chave).map_or("", String::as_str);
-        let aviso = match fmt::ler_qtd(digitado) {
-            Some(r) if r > quant => Some((
-                format!("{} pç acima da quantidade da OP; o consumo parcial usa o valor digitado.", fmt::qtd(r - quant)),
-                text::warning as EstiloTexto,
-            )),
-            Some(r) => Some((format!("faltam {} pç", fmt::qtd(quant - r)), text::secondary as EstiloTexto)),
-            None if digitado.trim().is_empty() => None,
-            None => Some((
-                "Quantidade inválida, não considerada: informe um número maior que zero ou deixe vazio.".to_string(),
-                text::danger as EstiloTexto,
-            )),
+        let salvo = self.lancamento(chave);
+        let editado = self.campos_vol.get(&chave);
+        let campos = editado.cloned().unwrap_or_else(|| Campos::do_lancamento(salvo));
+        let lido = campos.ler();
+        let grupos_salvos = salvo.map(Lancamento::grupos).unwrap_or_default();
+        // Confirmar só quando o digitado é válido e muda o que está salvo.
+        let muda = match &lido {
+            Ok(g) if g.is_empty() => salvo.is_some(),
+            Ok(g) => *g != grupos_salvos,
+            Err(_) => false,
         };
-        let mut linha = row![
-            text("Realizado parcial").size(12),
-            text_input("0", digitado)
-                .on_input(move |s| Message::Realizado(chave, s))
-                .size(12)
-                .padding([4, 8])
-                .width(110),
-            text(format!("de {} pç", fmt::qtd(quant))).size(12).style(text::secondary),
-        ]
-        .spacing(8)
-        .align_y(Center);
-        if let Some((msg, estilo)) = aviso {
-            linha = linha.push(text(msg).size(12).style(estilo));
+        let confirmar = (editado.is_some() && muda).then_some(Message::ConfirmarRealizado(chave));
+
+        let varios = campos.grupos.len() > 1;
+        let mut tipos = column![].spacing(4);
+        for (i, c) in campos.grupos.iter().enumerate() {
+            let subtotal = match (fmt::ler_qtd(&c.volumes), fmt::ler_qtd(&c.qtd_volume)) {
+                (Some(v), Some(q)) => format!("= {}", fmt::qtd(v * q)),
+                _ => String::new(),
+            };
+            tipos = tipos.push(
+                row![
+                    text(format!("Realizado parcial ({})", i + 1)).size(12).width(130),
+                    text_input("0", &c.volumes)
+                        .on_input(move |s| Message::VolTotal(chave, i, s))
+                        .on_submit_maybe(confirmar.clone())
+                        .size(12)
+                        .padding([4, 8])
+                        .width(80),
+                    text("volumes ×").size(12).style(text::secondary),
+                    text_input("0", &c.qtd_volume)
+                        .on_input(move |s| Message::VolQtd(chave, i, s))
+                        .on_submit_maybe(confirmar.clone())
+                        .size(12)
+                        .padding([4, 8])
+                        .width(90),
+                    text("pç/volume").size(12).style(text::secondary),
+                    text(subtotal).size(12).width(90),
+                    button(text("Remover").size(11))
+                        .padding([2, 8])
+                        .style(button::danger)
+                        .on_press_maybe(varios.then_some(Message::VolRemover(chave, i))),
+                ]
+                .spacing(8)
+                .align_y(Center),
+            );
         }
-        linha.into()
+
+        let resumo = match &lido {
+            Ok(g) if g.is_empty() && salvo.is_some() => text("REALIZADO PARCIAL = 0 (apaga o lançamento)").size(12).style(text::warning),
+            Ok(g) if g.is_empty() => text("REALIZADO PARCIAL = 0").size(12).style(text::secondary),
+            Ok(g) => text(format!("REALIZADO PARCIAL = {} ({})", fmt::qtd(parcial::total(g)), parcial::composicao(g))).size(12).font(NEGRITO),
+            Err(e) => text(e.clone()).size(12).style(text::warning),
+        };
+        let acoes = row![
+            button(text("+ Adicionar tipo de volume").size(11))
+                .padding([2, 8])
+                .style(button::secondary)
+                .on_press(Message::VolAdicionar(chave)),
+            resumo,
+            space::horizontal(),
+            button(text("Confirmar").size(12)).padding([3, 12]).style(button::primary).on_press_maybe(confirmar),
+        ]
+        .spacing(10)
+        .align_y(Center);
+
+        let produzido = salvo.map_or(0.0, |l| l.realizado);
+        let pct = if quant > 0.0 { produzido / quant * 100.0 } else { 0.0 };
+        let (resto, estilo): (String, EstiloTexto) = if produzido > quant {
+            (format!("{} pç acima do pedido", fmt::qtd(produzido - quant)), text::warning)
+        } else if produzido == quant && quant > 0.0 {
+            ("pedido completo".into(), text::success)
+        } else {
+            (format!("faltam {} pç", fmt::qtd(quant - produzido)), text::secondary)
+        };
+        let composicao_salva =
+            if grupos_salvos.is_empty() { String::new() } else { format!(" ({})", parcial::composicao(&grupos_salvos)) };
+        let total = row![
+            text(format!("Produzido {}{composicao_salva} de {} pç pedidas", fmt::qtd(produzido), fmt::qtd(quant)))
+                .size(12)
+                .font(NEGRITO),
+            text(format!("{}%", fmt::num(pct, 1))).size(12),
+            text(resto).size(12).style(estilo),
+        ]
+        .spacing(10)
+        .align_y(Center);
+
+        let mut col = column![tipos, acoes, total].spacing(6);
+        let (op, linha, cod_produto) = chave;
+        if let Some((op_conf, lista)) = &self.confirmacoes
+            && *op_conf == op
+        {
+            let mut anterior: Option<&Confirmacao> = None;
+            for c in lista.iter().filter(|c| c.linha == linha && c.cod_produto == cod_produto) {
+                let quem = c.usuario.as_deref().map(|u| format!("  ·  {u}")).unwrap_or_default();
+                col = col.push(
+                    text(format!(
+                        "{}   {}   → total {}{quem}",
+                        historico::hora_local(&c.em),
+                        c.delta(anterior),
+                        fmt::qtd(c.realizado)
+                    ))
+                    .size(11)
+                    .style(text::secondary),
+                );
+                anterior = Some(c);
+            }
+        }
+        col.into()
     }
 
     fn view_item_op<'a>(&'a self, a: &'a Analise, chave: parcial::Chave, item: &'a ItemOp) -> Element<'a, Message> {
