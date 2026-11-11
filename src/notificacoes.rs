@@ -55,11 +55,11 @@ fn interpretar(dados: &str, eu: &str) -> Option<Aviso> {
     })
 }
 
-/// Fluxo de avisos do servidor em `raiz` para a `Subscription` da interface.
-/// Trocar o endereço cria outro fluxo; este para quando a interface o solta.
-#[allow(clippy::ptr_arg)] // `Subscription::run_with` passa `&D`, e aqui D = String
-pub fn fluxo(raiz: &String) -> mpsc::UnboundedReceiver<Aviso> {
-    let raiz = raiz.clone();
+/// Fluxo de avisos para a `Subscription` da interface. `chave` = (endereço do
+/// servidor, nome do usuário): trocar qualquer um cria outro fluxo (o servidor
+/// passa a ver o nome novo em "usuários ativos"); este para quando a interface o solta.
+pub fn fluxo(chave: &(String, String)) -> mpsc::UnboundedReceiver<Aviso> {
+    let raiz = chave.0.clone();
     let (tx, rx) = mpsc::unbounded();
     std::thread::spawn(move || {
         loop {

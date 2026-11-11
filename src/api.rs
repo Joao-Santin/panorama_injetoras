@@ -36,6 +36,12 @@ pub fn cliente_http(tempo_limite: Option<Duration>) -> Result<reqwest::blocking:
         headers.insert("x-api-key", valor);
     }
     headers.insert("x-cliente-id", HeaderValue::from_str(cliente_id()).expect("id só com ASCII"));
+    // Quem está usando: vai para o histórico e para a lista de usuários ativos.
+    // Codificado porque header só aceita ASCII ("João" → "Jo%C3%A3o").
+    let codificado = |s: String| HeaderValue::from_str(&crate::historico::codificar(&s)).expect("codificado é ASCII");
+    headers.insert("x-programa", HeaderValue::from_static(crate::historico::PROGRAMA));
+    headers.insert("x-usuario", codificado(crate::config::usuario()));
+    headers.insert("x-maquina", codificado(crate::config::maquina()));
     Ok(reqwest::blocking::Client::builder().timeout(tempo_limite).default_headers(headers).build()?)
 }
 

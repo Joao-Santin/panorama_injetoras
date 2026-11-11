@@ -17,6 +17,8 @@ pub const URL_PADRAO: &str = "http://localhost:3000";
 pub struct Config {
     /// Endereço do servidor, sem o `/api`. `None` = usar `BIPLAS_SERVER_URL` ou o padrão.
     pub servidor_url: Option<String>,
+    /// Nome de quem usa o programa neste computador. `None` = usuário do Windows.
+    pub usuario: Option<String>,
 }
 
 static ATUAL: LazyLock<RwLock<Config>> = LazyLock::new(|| RwLock::new(ler().unwrap_or_default()));
@@ -75,6 +77,36 @@ pub fn url_padrao() -> String {
         .trim()
         .trim_end_matches('/')
         .to_string()
+}
+
+/// Usuário do Windows (`USERNAME`), usado quando não há nome nas configurações.
+pub fn usuario_windows() -> String {
+    std::env::var("USERNAME").or_else(|_| std::env::var("USER")).unwrap_or_else(|_| "desconhecido".into())
+}
+
+/// Nome de quem usa o programa: o das configurações, senão o do Windows.
+pub fn usuario() -> String {
+    atual().usuario.map(|u| u.trim().to_string()).filter(|u| !u.is_empty()).unwrap_or_else(usuario_windows)
+}
+
+/// Nome deste computador na rede.
+pub fn maquina() -> String {
+    std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "desconhecida".into())
+}
+
+/// IP deste computador na rede: o da placa usada para chegar ao servidor.
+/// Não envia nada: só pergunta ao sistema qual seria a rota. Se o servidor for
+/// este mesmo computador (localhost), usa a rota da internet.
+pub fn ip_local() -> Option<String> {
+    let rota = |destino: &str| -> Option<std::net::IpAddr> {
+        let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+        s.connect(destino).ok()?;
+        Some(s.local_addr().ok()?.ip())
+    };
+    let url = url_servidor();
+    let host = url.split_once("://").map_or(url.as_str(), |(_, r)| r).split('/').next().unwrap_or("").to_string();
+    let destino = if host.contains(':') { host } else { format!("{host}:80") };
+    rota(&destino).filter(|ip| !ip.is_loopback()).or_else(|| rota("8.8.8.8:80")).map(|ip| ip.to_string())
 }
 
 /// Confere e arruma o endereço digitado. Vazio = `None` (volta ao padrão).

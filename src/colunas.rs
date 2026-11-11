@@ -172,6 +172,41 @@ impl Coluna for ColunaProd {
 }
 
 /// Mudança pedida no painel "Configurar colunas".
+/// Descreve a mudança de configuração de colunas guardada no histórico
+/// (`antes`/`depois` = lista `colunas` como o servidor guarda; `null` = padrão).
+pub fn descrever_mudanca(tabela: &str, antes: &serde_json::Value, depois: &serde_json::Value) -> String {
+    match tabela {
+        ColunaNec::TABELA => descrever::<ColunaNec>("Necessidades", antes, depois),
+        ColunaProd::TABELA => descrever::<ColunaProd>("Produtos", antes, depois),
+        outra => format!("Alterou as colunas de {outra}"),
+    }
+}
+
+fn descrever<C: Coluna>(nome: &str, antes: &serde_json::Value, depois: &serde_json::Value) -> String {
+    let ler = |v: &serde_json::Value| ConfigColunas::<C>::do_servidor(serde_json::json!({ "colunas": v }));
+    let (a, d) = (ler(antes), ler(depois));
+    let visivel = |cfg: &ConfigColunas<C>, c: C| cfg.colunas.iter().any(|(x, v)| *x == c && *v);
+    let nomes = |lista: Vec<C>| lista.into_iter().map(Coluna::rotulo).collect::<Vec<_>>().join(", ");
+
+    let mostrou: Vec<C> = d.visiveis().filter(|&c| !visivel(&a, c)).collect();
+    let ocultou: Vec<C> = a.visiveis().filter(|&c| !visivel(&d, c)).collect();
+    let ordem = |cfg: &ConfigColunas<C>| cfg.colunas.iter().map(|(c, _)| *c).collect::<Vec<_>>();
+    let mut partes = Vec::new();
+    if !mostrou.is_empty() {
+        partes.push(format!("mostrou {}", nomes(mostrou)));
+    }
+    if !ocultou.is_empty() {
+        partes.push(format!("ocultou {}", nomes(ocultou)));
+    }
+    if ordem(&a) != ordem(&d) {
+        partes.push("mudou a ordem".to_string());
+    }
+    if partes.is_empty() {
+        partes.push("sem mudança visível".to_string());
+    }
+    format!("Colunas de {nome}: {}", partes.join("; "))
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum AcaoColuna {
     Visivel(usize, bool),

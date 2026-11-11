@@ -27,6 +27,7 @@ use crate::{
     config,
     estrutura::{self, Estrutura, MaterialSomado, No, TipoNo},
     fmt,
+    historico::{self, ClienteAtivo, Registro},
     modelo::{ItemComposicao, ItemOp, Op, Produto},
     notificacoes::{self, Aviso, EstadoSync},
     parcial::{self, Lancamento},
@@ -257,6 +258,7 @@ pub enum Message {
     FiltroGrav(FiltroGrav),
     BuscaProd(String),
     SoUsados(bool),
+    SoNegativos(bool),
     ModoConfigProd(bool),
     SelProduto(i64),
     FecharProduto,
@@ -266,6 +268,59 @@ pub enum Message {
     ConfigUrl(String),
     ConfigSalvar,
     ConfigPadrao,
+    ConfigSub(SubConfig),
+    ConfigUsuario(String),
+    ConfigSalvarUsuario,
+    HistFiltro(FiltroUsuario),
+    HistMais,
+    HistAtualizar,
+    Historico(Result<PaginaHist, String>),
+    HistUsuarios(Result<Vec<String>, String>),
+    Ativos(Result<Vec<ClienteAtivo>, String>),
+    AtivosAtualizar,
+}
+
+/// Telas dentro da aba Configurações.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubConfig {
+    Geral,
+    Historico,
+    Ativos,
+}
+
+/// De quem mostrar o histórico.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FiltroUsuario {
+    Todos,
+    Usuario(String),
+}
+
+impl FiltroUsuario {
+    fn nome(&self) -> Option<String> {
+        match self {
+            Self::Todos => None,
+            Self::Usuario(u) => Some(u.clone()),
+        }
+    }
+}
+
+impl std::fmt::Display for FiltroUsuario {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Todos => write!(f, "Todos os usuários"),
+            Self::Usuario(u) => write!(f, "{u}"),
+        }
+    }
+}
+
+/// Página do histórico lida do servidor.
+#[derive(Debug, Clone)]
+pub struct PaginaHist {
+    /// Filtro usado no pedido: se mudou nesse meio-tempo, a resposta é descartada.
+    filtro: Option<String>,
+    /// `true` = continuação ("Carregar mais"); `false` = primeira página.
+    anexar: bool,
+    lista: Vec<Registro>,
 }
 
 /// Recorte de uma lista em páginas de `ITENS_POR_PAGINA`.
@@ -338,6 +393,8 @@ pub struct App {
     filtro_grav: FiltroGrav,
     busca_prod: String,
     so_usados: bool,
+    /// Aba Produtos: só os itens com estoque abaixo de zero.
+    so_negativos: bool,
     config_prod: ConfigColunas<ColunaProd>,
     modo_config_prod: bool,
     produto_sel: Option<i64>,
@@ -351,6 +408,22 @@ pub struct App {
     cfg_url: String,
     /// Resultado do último "Salvar" da aba Configurações (erro?, mensagem).
     cfg_status: Option<(bool, String)>,
+    cfg_sub: SubConfig,
+    /// Nome de usuário em uso. Mudar refaz a conexão dos avisos (o servidor vê o nome novo).
+    usuario: String,
+    /// Texto do campo de nome de usuário, como foi digitado.
+    cfg_usuario: String,
+    cfg_status_usuario: Option<(bool, String)>,
+    ip_local: Option<String>,
+    historico: Vec<Registro>,
+    hist_filtro: FiltroUsuario,
+    hist_usuarios: Vec<String>,
+    /// Não há registros mais antigos para carregar.
+    hist_fim: bool,
+    hist_carregando: bool,
+    hist_erro: Option<String>,
+    ativos: Vec<ClienteAtivo>,
+    ativos_erro: Option<String>,
 }
 
 /// Roda `f` numa thread (as chamadas ao servidor bloqueiam) e entrega o resultado em `msg`.
@@ -394,6 +467,14 @@ fn carregar_simulacoes() -> Task<Message> {
 
 fn carregar_parciais() -> Task<Message> {
     em_segundo_plano(|| Ok(Recarga::Parciais(Servidor::new()?.get("/api/panorama/parciais")?)), Message::Recarga)
+}
+
+fn carregar_usuarios_hist() -> Task<Message> {
+    em_segundo_plano(historico::usuarios, Message::HistUsuarios)
+}
+
+fn carregar_ativos() -> Task<Message> {
+    em_segundo_plano(historico::ativos, Message::Ativos)
 }
 
 /// Pede ao servidor para buscar de novo no eGestor ou no Trello.
@@ -492,6 +573,7 @@ impl App {
             filtro_grav: FiltroGrav::Todas,
             busca_prod: String::new(),
             so_usados: false,
+            so_negativos: false,
             config_prod: ConfigColunas::default(),
             modo_config_prod: false,
             produto_sel: None,
@@ -501,12 +583,25 @@ impl App {
             servidor: api::url_servidor(),
             cfg_url: config::atual().servidor_url.unwrap_or_default(),
             cfg_status: None,
+            cfg_sub: SubConfig::Geral,
+            usuario: config::usuario(),
+            cfg_usuario: config::atual().usuario.unwrap_or_default(),
+            cfg_status_usuario: None,
+            ip_local: config::ip_local(),
+            historico: Vec::new(),
+            hist_filtro: FiltroUsuario::Todos,
+            hist_usuarios: Vec::new(),
+            hist_fim: false,
+            hist_carregando: false,
+            hist_erro: None,
+            ativos: Vec::new(),
+            ativos_erro: None,
         };
         (app, Task::none())
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        Subscription::run_with(self.servidor.clone(), notificacoes::fluxo).map(Message::Aviso)
+        Subscription::run_with((self.servidor.clone(), self.usuario.clone()), notificacoes::fluxo).map(Message::Aviso)
     }
 
     fn titulo(&self) -> String {
@@ -626,7 +721,10 @@ impl App {
                 }
             }
             Message::AlternarTema => self.escuro = !self.escuro,
-            Message::Aba(a) => self.aba = a,
+            Message::Aba(a) => {
+                self.aba = a;
+                return self.recarregar_config_visivel();
+            }
             Message::BuscaNec(s) => self.busca_nec = s,
             Message::SoFaltas(b) => self.so_faltas = b,
             Message::OrdemNec(o) => self.ordem_nec = o,
@@ -752,6 +850,10 @@ impl App {
                 self.busca_prod = s;
                 return self.ir_para_pagina_prod(0);
             }
+            Message::SoNegativos(b) => {
+                self.so_negativos = b;
+                return self.ir_para_pagina_prod(0);
+            }
             Message::SoUsados(b) => {
                 self.so_usados = b;
                 return self.ir_para_pagina_prod(0);
@@ -781,8 +883,92 @@ impl App {
                 self.cfg_url.clear();
                 self.salvar_config();
             }
+            Message::ConfigSub(s) => {
+                self.cfg_sub = s;
+                return self.recarregar_config_visivel();
+            }
+            Message::ConfigUsuario(s) => {
+                self.cfg_usuario = s;
+                self.cfg_status_usuario = None;
+            }
+            Message::ConfigSalvarUsuario => self.salvar_usuario(),
+            Message::HistFiltro(f) => {
+                self.hist_filtro = f;
+                self.historico.clear();
+                return self.carregar_historico(false);
+            }
+            Message::HistMais => return self.carregar_historico(true),
+            Message::HistAtualizar => {
+                return Task::batch([self.carregar_historico(false), carregar_usuarios_hist()]);
+            }
+            Message::Historico(Ok(p)) => {
+                if p.filtro == self.hist_filtro.nome() {
+                    self.hist_carregando = false;
+                    self.hist_erro = None;
+                    self.hist_fim = p.lista.len() < historico::POR_PAGINA;
+                    if !p.anexar {
+                        self.historico.clear();
+                    }
+                    self.historico.extend(p.lista);
+                }
+            }
+            Message::Historico(Err(e)) => {
+                self.hist_carregando = false;
+                self.hist_erro = Some(e);
+            }
+            Message::HistUsuarios(Ok(u)) => self.hist_usuarios = u,
+            Message::HistUsuarios(Err(e)) => self.hist_erro = Some(e),
+            Message::Ativos(Ok(lista)) => {
+                self.ativos = lista;
+                self.ativos_erro = None;
+            }
+            Message::Ativos(Err(e)) => self.ativos_erro = Some(e),
+            Message::AtivosAtualizar => return carregar_ativos(),
         }
         Task::none()
+    }
+
+    /// Recarrega o histórico ou os usuários ativos, se estiverem na tela.
+    fn recarregar_config_visivel(&mut self) -> Task<Message> {
+        if self.aba != Aba::Configuracoes {
+            return Task::none();
+        }
+        match self.cfg_sub {
+            SubConfig::Geral => Task::none(),
+            SubConfig::Historico => Task::batch([self.carregar_historico(false), carregar_usuarios_hist()]),
+            SubConfig::Ativos => carregar_ativos(),
+        }
+    }
+
+    /// Primeira página do histórico (`anexar = false`) ou a seguinte, mais antiga.
+    fn carregar_historico(&mut self, anexar: bool) -> Task<Message> {
+        let antes = if anexar { self.historico.last().map(|r| r.id) } else { None };
+        if anexar && antes.is_none() {
+            return Task::none();
+        }
+        self.hist_carregando = true;
+        let filtro = self.hist_filtro.nome();
+        em_segundo_plano(
+            move || {
+                let lista = historico::buscar(filtro.as_deref(), antes)?;
+                Ok(PaginaHist { filtro, anexar, lista })
+            },
+            Message::Historico,
+        )
+    }
+
+    fn salvar_usuario(&mut self) {
+        let nome = self.cfg_usuario.trim().to_string();
+        let mut nova = config::atual();
+        nova.usuario = (!nome.is_empty()).then_some(nome);
+        if let Err(e) = config::salvar(nova.clone()) {
+            self.cfg_status_usuario = Some((true, format!("Não salvei: {e:#}")));
+            return;
+        }
+        self.cfg_usuario = nova.usuario.unwrap_or_default();
+        // A conexão de avisos é refeita com o nome novo (ela é quem aparece em "Usuários ativos").
+        self.usuario = config::usuario();
+        self.cfg_status_usuario = Some((false, format!("Salvo. As próximas ações serão registradas como \"{}\".", self.usuario)));
     }
 
     /// Pede ao servidor para ler o Trello de novo; a situação nova chega pelos avisos.
@@ -826,6 +1012,10 @@ impl App {
             return;
         }
         self.servidor = servidor;
+        self.ip_local = config::ip_local();
+        self.historico.clear();
+        self.hist_usuarios.clear();
+        self.ativos.clear();
         self.analise = None;
         self.coletando = None;
         self.conectado = false;
@@ -845,7 +1035,14 @@ impl App {
                     self.status = None;
                 }
                 self.buscando_trello = true;
-                Task::batch([carregar_egestor(), carregar_trello(), carregar_colunas(), carregar_simulacoes(), carregar_parciais()])
+                Task::batch([
+                    carregar_egestor(),
+                    carregar_trello(),
+                    carregar_colunas(),
+                    carregar_simulacoes(),
+                    carregar_parciais(),
+                    self.recarregar_config_visivel(),
+                ])
             }
             Aviso::Desconectado(e) => {
                 self.conectado = false;
@@ -885,6 +1082,10 @@ impl App {
                 "colunas" => carregar_colunas(),
                 "simulacoes" => carregar_simulacoes(),
                 "parciais" => carregar_parciais(),
+                "historico" if self.aba == Aba::Configuracoes && self.cfg_sub == SubConfig::Historico => {
+                    Task::batch([self.carregar_historico(false), carregar_usuarios_hist()])
+                }
+                "clientes" if self.aba == Aba::Configuracoes && self.cfg_sub == SubConfig::Ativos => carregar_ativos(),
                 _ => Task::none(),
             },
         }
@@ -916,6 +1117,7 @@ impl App {
         a.produtos
             .values()
             .filter(|p| !self.so_usados || usados.contains(&p.codigo))
+            .filter(|p| !self.so_negativos || p.estoque < 0.0)
             .filter(|p| {
                 contem(&p.descricao, &busca)
                     || contem(&p.codigo_proprio, &busca)
@@ -1095,6 +1297,143 @@ impl App {
     // -------------------------------------------------- Configurações ---
 
     fn view_configuracoes(&self) -> Element<'_, Message> {
+        let subs = [
+            (SubConfig::Geral, "Geral".to_string()),
+            (SubConfig::Historico, "Histórico".to_string()),
+            (SubConfig::Ativos, format!("Usuários ativos{}", if self.ativos.is_empty() { String::new() } else { format!(" ({})", self.ativos.len()) })),
+        ];
+        let mut abas = row![].spacing(4);
+        for (sub, rotulo) in subs {
+            let estilo: EstiloBotao = if self.cfg_sub == sub { button::secondary } else { button::text };
+            abas = abas.push(button(text(rotulo).size(13)).padding([4, 12]).style(estilo).on_press(Message::ConfigSub(sub)));
+        }
+        let corpo = match self.cfg_sub {
+            SubConfig::Geral => self.view_config_geral(),
+            SubConfig::Historico => self.view_config_historico(),
+            SubConfig::Ativos => self.view_config_ativos(),
+        };
+        column![abas, corpo].spacing(12).into()
+    }
+
+    fn view_config_historico(&self) -> Element<'_, Message> {
+        let mut opcoes = vec![FiltroUsuario::Todos];
+        let mut nomes = self.hist_usuarios.clone();
+        if !nomes.contains(&self.usuario) {
+            nomes.push(self.usuario.clone());
+            nomes.sort();
+        }
+        opcoes.extend(nomes.into_iter().map(FiltroUsuario::Usuario));
+        let so_eu = FiltroUsuario::Usuario(self.usuario.clone());
+
+        let mut topo = row![
+            pick_list(opcoes, Some(self.hist_filtro.clone()), Message::HistFiltro).text_size(13).width(260),
+            button(text("Só eu").size(12))
+                .padding([4, 10])
+                .style(button::secondary)
+                .on_press_maybe((self.hist_filtro != so_eu).then_some(Message::HistFiltro(so_eu))),
+            button(text("Atualizar").size(12)).padding([4, 10]).style(button::secondary).on_press(Message::HistAtualizar),
+            space::horizontal(),
+        ]
+        .spacing(8)
+        .align_y(Center);
+        topo = topo.push(
+            text(if self.hist_carregando { "Carregando...".to_string() } else { format!("{} registros", self.historico.len()) })
+                .size(12)
+                .style(text::secondary),
+        );
+
+        let mut col = column![topo].spacing(8);
+        if let Some(e) = &self.hist_erro {
+            col = col.push(text(format!("Não consegui ler o histórico: {e}")).size(13).style(text::danger));
+        }
+        let cab = |t: &'static str| text(t).size(12).font(NEGRITO).style(text::secondary);
+        col = col.push(
+            row![cab("Data e hora").width(150), cab("Usuário").width(150), cab("Computador").width(200), cab("Ação").width(Fill)]
+                .spacing(10)
+                .padding([0, 8]),
+        );
+        let produtos = self.analise.as_ref().map(|a| &a.produtos);
+        let mut linhas = column![].spacing(2);
+        for r in &self.historico {
+            let computador = match (&r.maquina, &r.ip) {
+                (Some(m), Some(ip)) => format!("{m} ({ip})"),
+                (Some(m), None) => m.clone(),
+                (None, Some(ip)) => ip.clone(),
+                (None, None) => "—".into(),
+            };
+            linhas = linhas.push(
+                container(
+                    row![
+                        text(historico::hora_local(&r.em)).size(12).width(150),
+                        text(r.usuario.clone().unwrap_or_else(|| "—".into())).size(12).width(150),
+                        text(computador).size(12).width(200),
+                        text(historico::descrever(r, produtos)).size(12).width(Fill),
+                    ]
+                    .spacing(10),
+                )
+                .padding([4, 8])
+                .style(container::rounded_box),
+            );
+        }
+        if self.historico.is_empty() && !self.hist_carregando && self.hist_erro.is_none() {
+            linhas = linhas.push(text("Nenhuma ação registrada.").size(13).style(text::secondary));
+        }
+        if !self.hist_fim && !self.historico.is_empty() {
+            linhas = linhas.push(
+                button(text("Carregar mais").size(12))
+                    .padding([4, 12])
+                    .style(button::secondary)
+                    .on_press_maybe((!self.hist_carregando).then_some(Message::HistMais)),
+            );
+        }
+        col.push(scrollable(linhas.padding(iced::Padding::ZERO.right(FOLGA_ROLAGEM))).height(Fill)).into()
+    }
+
+    fn view_config_ativos(&self) -> Element<'_, Message> {
+        let mut col = column![
+            row![
+                text(format!("{} panorama(s) aberto(s) agora", self.ativos.len())).size(15).font(NEGRITO),
+                space::horizontal(),
+                button(text("Atualizar").size(12)).padding([4, 10]).style(button::secondary).on_press(Message::AtivosAtualizar),
+            ]
+            .align_y(Center),
+            text("A lista se atualiza sozinha quando alguém abre ou fecha o programa.").size(12).style(text::secondary),
+        ]
+        .spacing(8);
+        if let Some(e) = &self.ativos_erro {
+            col = col.push(text(format!("Não consegui ler os usuários ativos: {e}")).size(13).style(text::danger));
+        }
+        let cab = |t: &'static str| text(t).size(12).font(NEGRITO).style(text::secondary);
+        col = col.push(
+            row![cab("Usuário").width(200), cab("Computador").width(200), cab("IP").width(150), cab("Aberto desde").width(Fill)]
+                .spacing(10)
+                .padding([0, 8]),
+        );
+        let eu = api::cliente_id();
+        let mut linhas = column![].spacing(2);
+        for c in &self.ativos {
+            let mut usuario = c.usuario.clone().unwrap_or_else(|| "—".into());
+            if c.cliente_id.as_deref() == Some(eu) {
+                usuario.push_str("  (este programa)");
+            }
+            linhas = linhas.push(
+                container(
+                    row![
+                        text(usuario).size(13).width(200),
+                        text(c.maquina.clone().unwrap_or_else(|| "—".into())).size(13).width(200),
+                        text(c.ip.clone().unwrap_or_else(|| "—".into())).size(13).width(150),
+                        text(historico::hora_local(&c.conectado_em)).size(13).width(Fill),
+                    ]
+                    .spacing(10),
+                )
+                .padding([6, 8])
+                .style(container::rounded_box),
+            );
+        }
+        col.push(scrollable(linhas.padding(iced::Padding::ZERO.right(FOLGA_ROLAGEM))).height(Fill)).into()
+    }
+
+    fn view_config_geral<'a>(&'a self) -> Element<'a, Message> {
         let digitado = config::normalizar_url(&self.cfg_url);
         let mudou = digitado.as_ref().is_ok_and(|u| *u != config::atual().servidor_url);
         let conexao = if self.conectado {
@@ -1129,12 +1468,42 @@ impl App {
             servidor = servidor.push(text(msg.as_str()).size(13).style(estilo));
         }
 
+        let nome_digitado = self.cfg_usuario.trim();
+        let mudou_nome = Some(nome_digitado).filter(|n| !n.is_empty()).map(String::from) != config::atual().usuario;
+        let mut usuario = column![
+            text("Usuário").size(18).font(NEGRITO),
+            text("Nome de quem usa o programa neste computador. É o que aparece no histórico e em Usuários ativos.")
+                .size(13)
+                .style(text::secondary),
+            row![
+                text_input(&format!("Vazio = usuário do Windows ({})", config::usuario_windows()), &self.cfg_usuario)
+                    .on_input(Message::ConfigUsuario)
+                    .on_submit(Message::ConfigSalvarUsuario)
+                    .width(420),
+                button("Salvar").style(button::primary).on_press_maybe(mudou_nome.then_some(Message::ConfigSalvarUsuario)),
+            ]
+            .spacing(8)
+            .align_y(Center),
+            text(format!(
+                "Em uso: {}  ·  Computador: {}  ·  IP: {}",
+                self.usuario,
+                config::maquina(),
+                self.ip_local.as_deref().unwrap_or("não identificado"),
+            ))
+            .size(13),
+        ]
+        .spacing(8);
+        if let Some((erro, msg)) = &self.cfg_status_usuario {
+            let estilo: EstiloTexto = if *erro { text::danger } else { text::success };
+            usuario = usuario.push(text(msg.as_str()).size(13).style(estilo));
+        }
+
         let rodape = text(format!("Configurações deste computador, guardadas em {}", config::caminho().display()))
             .size(12)
             .style(text::secondary);
 
-        scrollable(column![container(servidor).padding(16).style(container::rounded_box), rodape].spacing(16).max_width(900))
-            .into()
+        let cartao = |c: Column<'a, Message>| container(c).padding(16).style(container::rounded_box);
+        scrollable(column![cartao(usuario), cartao(servidor), rodape].spacing(16).max_width(900)).into()
     }
 
     // --------------------------------------------------------- Resumo ---
@@ -2013,6 +2382,7 @@ impl App {
         let filtros = row![
             text_input("Buscar produto, código, categoria ou tag...", &self.busca_prod).on_input(Message::BuscaProd).width(340),
             toggler(self.so_usados).label("Somente itens usados nas OPs em aberto").on_toggle(Message::SoUsados),
+            toggler(self.so_negativos).label("Somente com estoque negativo").on_toggle(Message::SoNegativos),
             space::horizontal(),
             text(format!("{} produtos", pag.total)).size(13),
             botao_config_colunas(self.modo_config_prod, Message::ModoConfigProd(!self.modo_config_prod)),
