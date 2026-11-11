@@ -26,6 +26,7 @@ mod estrutura;
 mod fmt;
 mod gui;
 mod historico;
+mod locais;
 mod modelo;
 mod notificacoes;
 mod parcial;

@@ -28,6 +28,7 @@ use crate::{
     estrutura::{self, Estrutura, MaterialSomado, No, TipoNo},
     fmt,
     historico::{self, ClienteAtivo, Registro},
+    locais::{self, Locais},
     modelo::{ItemComposicao, ItemOp, Op, Produto},
     notificacoes::{self, Aviso, EstadoSync},
     parcial::{self, Campos, Confirmacao, Grupo, Lancamento},
@@ -277,6 +278,8 @@ pub enum Message {
     BuscaProd(String),
     SoUsados(bool),
     SoNegativos(bool),
+    /// Junta numa linha só o item de produção e as cópias dele em outros locais (almoxarifado...).
+    JuntarLocais(bool),
     ModoConfigProd(bool),
     SelProduto(i64),
     FecharProduto,
@@ -440,6 +443,9 @@ pub struct App {
     so_usados: bool,
     /// Aba Produtos: só os itens com estoque abaixo de zero.
     so_negativos: bool,
+    juntar_locais: bool,
+    /// Cópias de cada item em outros locais, calculadas quando os dados chegam.
+    locais: locais::Locais,
     config_prod: ConfigColunas<ColunaProd>,
     modo_config_prod: bool,
     /// Seletor de cores aberto no painel "Configurar colunas".
@@ -623,6 +629,8 @@ impl App {
             busca_prod: String::new(),
             so_usados: false,
             so_negativos: false,
+            juntar_locais: false,
+            locais: locais::Locais::default(),
             config_prod: ConfigColunas::default(),
             modo_config_prod: false,
             editor_cor: None,
@@ -698,6 +706,7 @@ impl App {
                 if self.op_sel.is_some_and(|c| !a.ops.iter().any(|o| o.codigo == c)) {
                     self.op_sel = None;
                 }
+                self.locais = locais::agrupar(&a.produtos);
                 self.analise = Some(a);
                 // Mantém o grupo, descartando OPs que não estão mais em aberto.
                 let abertas: HashSet<i64> = self.analise.iter().flat_map(|a| &a.ops).map(|o| o.codigo).collect();
@@ -976,6 +985,14 @@ impl App {
             }
             Message::SoNegativos(b) => {
                 self.so_negativos = b;
+                return self.ir_para_pagina_prod(0);
+            }
+            Message::JuntarLocais(b) => {
+                self.juntar_locais = b;
+                // A cópia aberta some da lista: passa a valer o item de produção.
+                if b && let Some(c) = self.produto_sel.filter(|c| self.locais.copias.contains(c)) {
+                    self.produto_sel = self.locais.outros.iter().find(|(_, v)| v.iter().any(|x| x.codigo == c)).map(|(k, _)| *k);
+                }
                 return self.ir_para_pagina_prod(0);
             }
             Message::SoUsados(b) => {
@@ -1312,6 +1329,11 @@ impl App {
     }
 
     /// Produtos que passam pela busca e pelo filtro da aba Produtos (sem ordem definida).
+    /// Cópias em outros locais, quando a opção de juntá-las está ligada.
+    fn locais_juntados(&self) -> Option<&Locais> {
+        self.juntar_locais.then_some(&self.locais)
+    }
+
     fn produtos_filtrados<'a>(&self, a: &'a Analise) -> Vec<&'a Produto> {
         let busca = self.busca_prod.to_lowercase();
         let usados: HashSet<i64> = if self.so_usados {
@@ -1323,16 +1345,28 @@ impl App {
         } else {
             HashSet::new()
         };
+        let juntar = self.locais_juntados();
+        // Com os locais juntados, a linha é do item de produção e vale para todas as cópias:
+        // a busca acha por qualquer uma, e "estoque negativo" olha o total.
+        let acha = |p: &Produto| {
+            contem(&p.descricao, &busca)
+                || contem(&p.codigo_proprio, &busca)
+                || contem(&p.tags.join(" "), &busca)
+                || contem(a.categoria_de(p.cod_categoria), &busca)
+                || p.codigo.to_string() == busca
+        };
+        let usado = |p: &Produto| match juntar {
+            Some(l) => l.codigos(p).any(|c| usados.contains(&c)),
+            None => usados.contains(&p.codigo),
+        };
         a.produtos
             .values()
-            .filter(|p| !self.so_usados || usados.contains(&p.codigo))
-            .filter(|p| !self.so_negativos || p.estoque < 0.0)
-            .filter(|p| {
-                contem(&p.descricao, &busca)
-                    || contem(&p.codigo_proprio, &busca)
-                    || contem(&p.tags.join(" "), &busca)
-                    || contem(a.categoria_de(p.cod_categoria), &busca)
-                    || p.codigo.to_string() == busca
+            .filter(|p| juntar.is_none_or(|l| !l.copias.contains(&p.codigo)))
+            .filter(|p| !self.so_usados || usado(p))
+            .filter(|p| !self.so_negativos || juntar.map_or(p.estoque, |l| l.total(p)) < 0.0)
+            .filter(|p| match juntar {
+                Some(l) => l.codigos(p).filter_map(|c| a.produtos.get(&c)).any(acha),
+                None => acha(p),
             })
             .collect()
     }
@@ -2676,6 +2710,7 @@ impl App {
             text_input("Buscar produto, código, categoria ou tag...", &self.busca_prod).on_input(Message::BuscaProd).width(340),
             toggler(self.so_usados).label("Somente itens usados nas OPs em aberto").on_toggle(Message::SoUsados),
             toggler(self.so_negativos).label("Somente com estoque negativo").on_toggle(Message::SoNegativos),
+            toggler(self.juntar_locais).label("Juntar locais (almoxarifado...)").on_toggle(Message::JuntarLocais),
             space::horizontal(),
             text(format!("{} produtos", pag.total)).size(13),
             botao_config_colunas(self.modo_config_prod, Message::ModoConfigProd(!self.modo_config_prod)),
@@ -2684,7 +2719,7 @@ impl App {
         .align_y(Center);
 
         let sel = self.produto_sel;
-        let colunas: Vec<_> = self.config_prod.visiveis().map(|c| coluna_produto(c, self.config_prod.cor_de(c), a, sel, &self.produzido_parcial)).collect();
+        let colunas: Vec<_> = self.config_prod.visiveis().map(|c| coluna_produto(c, self.config_prod.cor_de(c), a, sel, &self.produzido_parcial, self.locais_juntados())).collect();
         let mut lista = column![].spacing(8);
         if pag.ultima > 0 {
             lista = lista.push(view_paginacao(pag));
@@ -2963,10 +2998,13 @@ fn coluna_produto<'a>(
     a: &'a Analise,
     sel: Option<i64>,
     produzido: &'a HashMap<i64, f64>,
+    locais: Option<&'a Locais>,
 ) -> table::Column<'a, 'a, &'a Produto, Message> {
     type P<'x> = &'x Produto;
     let titulo = cab(c.rotulo()).into();
     let produzido_de = move |p: P<'a>| produzido.get(&p.codigo).copied().unwrap_or(0.0);
+    // Com os locais juntados, o estoque é a soma de todos os locais.
+    let estoque_de = move |p: P<'a>| locais.map_or(p.estoque, |l| l.total(p));
     match c {
         ColunaProd::Codigo => col_num_cor(cor, titulo, 1, |p: P<'a>| cel(p.codigo.to_string())),
         ColunaProd::CodigoProprio => col_cor(cor, titulo, 2, |p: P<'a>| cel(p.codigo_proprio.as_str())),
@@ -2983,15 +3021,29 @@ fn coluna_produto<'a>(
             Some(_) => cel("Não").style(text::secondary),
         }),
         ColunaProd::Unidade => col_cor(cor, titulo, 1, |p: P<'a>| cel(p.unidade.as_str())),
-        ColunaProd::Estoque => col_num_cor(cor, titulo, 2, |p: P<'a>| {
-            cel(fmt::qtd(p.estoque)).style(if p.estoque < 0.0 { text::danger } else { sem_cor })
-        }),
+        ColunaProd::Estoque => {
+            let peso = if locais.is_some() { 3 } else { 2 };
+            col_num_cor(cor, titulo, peso, move |p: P<'a>| -> Element<'a, Message> {
+                let valor = |v: f64| cel(fmt::qtd(v)).style(if v < 0.0 { text::danger } else { sem_cor });
+                let Some(outros) = locais.and_then(|l| l.outros.get(&p.codigo)) else {
+                    return valor(p.estoque).into();
+                };
+                // "Produção: 114", "Almoxarifado: 3.000", "Total: 3.114".
+                let linha = |nome: &str, v: f64| row![cel(format!("{nome}:")).style(text::secondary), valor(v)].spacing(4);
+                let mut col = column![linha(locais::PRODUCAO, p.estoque)].align_x(Right);
+                for l in outros {
+                    col = col.push(linha(&l.nome, l.estoque));
+                }
+                let total = estoque_de(p);
+                col.push(row![cel("Total:").font(NEGRITO), valor(total).font(NEGRITO)].spacing(4)).into()
+            })
+        }
         ColunaProd::ProduzidoParcial => col_num_cor(cor, titulo, 2, move |p: P<'a>| match produzido_de(p) {
             v if v > 0.0 => cel(fmt::qtd(v)),
             _ => cel("—").style(text::secondary),
         }),
         ColunaProd::EstoqueReal => col_num_cor(cor, titulo, 2, move |p: P<'a>| {
-            let real = p.estoque + produzido_de(p);
+            let real = estoque_de(p) + produzido_de(p);
             cel(fmt::qtd(real)).style(if real < 0.0 { text::danger } else { sem_cor })
         }),
         ColunaProd::EstoqueMinimo => col_num_cor(cor, titulo, 2, |p: P<'a>| cel(fmt::qtd(p.estoque_minimo))),
