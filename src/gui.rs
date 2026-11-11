@@ -280,6 +280,8 @@ pub enum Message {
     SoNegativos(bool),
     /// Junta numa linha só o item de produção e as cópias dele em outros locais (almoxarifado...).
     JuntarLocais(bool),
+    /// O mesmo, na aba Necessidades (soma necessidade e estoque de todos os locais).
+    JuntarLocaisNec(bool),
     ModoConfigProd(bool),
     SelProduto(i64),
     FecharProduto,
@@ -444,6 +446,7 @@ pub struct App {
     /// Aba Produtos: só os itens com estoque abaixo de zero.
     so_negativos: bool,
     juntar_locais: bool,
+    juntar_locais_nec: bool,
     /// Cópias de cada item em outros locais, calculadas quando os dados chegam.
     locais: locais::Locais,
     config_prod: ConfigColunas<ColunaProd>,
@@ -630,6 +633,7 @@ impl App {
             so_usados: false,
             so_negativos: false,
             juntar_locais: false,
+            juntar_locais_nec: false,
             locais: locais::Locais::default(),
             config_prod: ConfigColunas::default(),
             modo_config_prod: false,
@@ -986,6 +990,14 @@ impl App {
             Message::SoNegativos(b) => {
                 self.so_negativos = b;
                 return self.ir_para_pagina_prod(0);
+            }
+            Message::JuntarLocaisNec(b) => {
+                self.juntar_locais_nec = b;
+                // O material aberto pode ser uma cópia, que some: passa a valer o item de produção.
+                if b && let Some(c) = self.material_sel.filter(|c| self.locais.copias.contains(c)) {
+                    self.material_sel = self.locais.outros.iter().find(|(_, v)| v.iter().any(|x| x.codigo == c)).map(|(k, _)| *k);
+                }
+                self.recalcular_simulacoes();
             }
             Message::JuntarLocais(b) => {
                 self.juntar_locais = b;
@@ -1392,6 +1404,11 @@ impl App {
                 let mut s = simulacao::calcular(a, &self.res_necessidades(a).necessidades, &self.simulacoes);
                 // Sempre de todas as OPs abertas, mesmo com grupo: o material já saiu do estoque físico.
                 parcial::aplicar(&mut s.linhas, &parcial::consumos(&a.ops, &self.lancamentos));
+                if self.juntar_locais_nec {
+                    locais::juntar_necessidades(&mut s.linhas, &self.locais, &a.produtos, |p| {
+                        a.categoria_de(p.cod_categoria).to_string()
+                    });
+                }
                 s
             }
             None => Simulado::default(),
@@ -1875,6 +1892,11 @@ impl App {
                     || contem(&n.categoria, &busca)
                     || n.tags.iter().any(|t| contem(t, &busca))
                     || n.cod_insumo.to_string() == busca
+                    // Com os locais juntados, acha também pelo código ou descrição das cópias.
+                    || (self.juntar_locais_nec
+                        && self.locais.codigos_de(n.cod_insumo).skip(1).filter_map(|c| a.produtos.get(&c)).any(|p| {
+                            contem(&p.descricao, &busca) || contem(&p.codigo_proprio, &busca) || p.codigo.to_string() == busca
+                        }))
             })
             .collect();
         match self.ordem_nec {
@@ -1896,6 +1918,7 @@ impl App {
                 .on_input(Message::BuscaNec)
                 .width(340),
             toggler(self.so_faltas).label("Somente com falta").on_toggle(Message::SoFaltas),
+            toggler(self.juntar_locais_nec).label("Juntar locais (almoxarifado...)").on_toggle(Message::JuntarLocaisNec),
             pick_list(OrdemNec::TODAS, Some(self.ordem_nec), Message::OrdemNec),
             space::horizontal(),
             text(format!("{} materiais  ·  custo das faltas listadas: {}", linhas.len(), fmt::moeda(custo_total))).size(13),
@@ -1913,16 +1936,17 @@ impl App {
         .align_y(Center);
 
         let sel = self.material_sel;
+        let locais_nec = self.juntar_locais_nec.then_some(&self.locais);
         // O cabeçalho é uma tabela à parte, fora da rolagem, para não descer com a lista. As colunas
         // são todas proporcionais: com a mesma largura disponível, as duas tabelas ficam alinhadas.
         // O espaçamento das células fica dentro delas (`pintar`), para a cor preencher a coluna.
-        let titulos: Vec<_> = self.config_nec.visiveis().map(|c| coluna_necessidade(c, self.config_nec.cor_de(c), sel, cab(c.rotulo()).into())).collect();
+        let titulos: Vec<_> = self.config_nec.visiveis().map(|c| coluna_necessidade(c, self.config_nec.cor_de(c), sel, locais_nec, cab(c.rotulo()).into())).collect();
         let sem_linhas: [&'a Necessidade; 0] = [];
         let cabecalho = container(table::table(titulos, sem_linhas).padding(0).width(Fill))
             .padding(iced::Padding { right: FOLGA_ROLAGEM, ..iced::Padding::ZERO })
             .width(Fill)
             .style(container::rounded_box);
-        let colunas: Vec<_> = self.config_nec.visiveis().map(|c| coluna_necessidade(c, self.config_nec.cor_de(c), sel, space().into())).collect();
+        let colunas: Vec<_> = self.config_nec.visiveis().map(|c| coluna_necessidade(c, self.config_nec.cor_de(c), sel, locais_nec, space().into())).collect();
         let lista = rolagem(table::table(colunas, linhas).padding(0).width(Fill)).height(Fill);
         let tabela = column![cabecalho, lista].width(Fill);
         // Em modo de configuração, o painel fica à direita da tabela (prévia ao vivo).
@@ -3023,20 +3047,7 @@ fn coluna_produto<'a>(
         ColunaProd::Unidade => col_cor(cor, titulo, 1, |p: P<'a>| cel(p.unidade.as_str())),
         ColunaProd::Estoque => {
             let peso = if locais.is_some() { 3 } else { 2 };
-            col_num_cor(cor, titulo, peso, move |p: P<'a>| -> Element<'a, Message> {
-                let valor = |v: f64| cel(fmt::qtd(v)).style(if v < 0.0 { text::danger } else { sem_cor });
-                let Some(outros) = locais.and_then(|l| l.outros.get(&p.codigo)) else {
-                    return valor(p.estoque).into();
-                };
-                // "Produção: 114", "Almoxarifado: 3.000", "Total: 3.114".
-                let linha = |nome: &str, v: f64| row![cel(format!("{nome}:")).style(text::secondary), valor(v)].spacing(4);
-                let mut col = column![linha(locais::PRODUCAO, p.estoque)].align_x(Right);
-                for l in outros {
-                    col = col.push(linha(&l.nome, l.estoque));
-                }
-                let total = estoque_de(p);
-                col.push(row![cel("Total:").font(NEGRITO), valor(total).font(NEGRITO)].spacing(4)).into()
-            })
+            col_num_cor(cor, titulo, peso, move |p: P<'a>| celula_estoque_locais(locais, p.codigo, p.estoque, estoque_de(p)))
         }
         ColunaProd::ProduzidoParcial => col_num_cor(cor, titulo, 2, move |p: P<'a>| match produzido_de(p) {
             v if v > 0.0 => cel(fmt::qtd(v)),
@@ -3330,11 +3341,27 @@ fn celula_saldo<'a>(saldo: f64) -> iced::widget::Text<'a> {
     cel(fmt::qtd(saldo)).style(e)
 }
 
+/// Estoque do item. Com os locais juntados e o item tendo cópias, mostra cada local
+/// e o total: "Produção: 114", "Almoxarifado: 3.000", "Total: 3.114".
+fn celula_estoque_locais<'a>(locais: Option<&'a Locais>, codigo: i64, producao: f64, total: f64) -> Element<'a, Message> {
+    let valor = |v: f64| cel(fmt::qtd(v)).style(if v < 0.0 { text::danger } else { sem_cor });
+    let Some(outros) = locais.and_then(|l| l.outros.get(&codigo)) else {
+        return valor(total).into();
+    };
+    let linha = |nome: &str, v: f64| row![cel(format!("{nome}:")).style(text::secondary), valor(v)].spacing(4);
+    let mut col = column![linha(locais::PRODUCAO, producao)].align_x(Right);
+    for l in outros {
+        col = col.push(linha(&l.nome, l.estoque));
+    }
+    col.push(row![cel("Total:").font(NEGRITO), valor(total).font(NEGRITO)].spacing(4)).into()
+}
+
 /// Monta uma coluna da tabela de Necessidades.
 fn coluna_necessidade<'a>(
     c: ColunaNec,
     cor: CorColuna,
     sel: Option<i64>,
+    locais: Option<&'a Locais>,
     cabecalho: Element<'a, Message>,
 ) -> table::Column<'a, 'a, &'a Necessidade, Message> {
     type N<'x> = &'x Necessidade;
@@ -3350,8 +3377,10 @@ fn coluna_necessidade<'a>(
         ColunaNec::Categoria => col_cor(cor, cabecalho, 2, |n: N<'a>| cel(n.categoria.as_str())),
         ColunaNec::Unidade => col_cor(cor, cabecalho, 1, |n: N<'a>| cel(n.unidade.as_str())),
         ColunaNec::Necessidade => col_num_cor(cor, cabecalho, 2, |n: N<'a>| cel(fmt::qtd(n.necessidade))),
-        ColunaNec::Estoque => col_num_cor(cor, cabecalho, 2, |n: N<'a>| {
-            cel(fmt::qtd(n.estoque)).style(if n.estoque < 0.0 { text::danger } else { sem_cor })
+        // Com os locais juntados, `n.estoque` já é o total de todos os locais.
+        ColunaNec::Estoque => col_num_cor(cor, cabecalho, if locais.is_some() { 3 } else { 2 }, move |n: N<'a>| {
+            let fora = locais.map_or(0.0, |l| l.estoque_fora(n.cod_insumo));
+            celula_estoque_locais(locais, n.cod_insumo, n.estoque - fora, n.estoque)
         }),
         ColunaNec::ConsumoParcial => col_num_cor(cor, cabecalho, 2, |n: N<'a>| {
             if n.consumo_parcial > 0.0 { cel(fmt::qtd(n.consumo_parcial)) } else { cel("—").style(text::secondary) }
