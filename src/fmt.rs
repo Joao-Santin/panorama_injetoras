@@ -34,6 +34,11 @@ pub fn qtd(v: f64) -> String {
     if (v - v.round()).abs() < 1e-9 { num(v, 0) } else { num(v, 3) }
 }
 
+/// Estoque: sempre 3 casas, mesmo quando o valor é redondo ("12,000").
+pub fn estoque(v: f64) -> String {
+    num(v, 3)
+}
+
 pub fn moeda(v: f64) -> String {
     // Espaço não separável: "R$" nunca fica numa linha e o valor em outra.
     format!("R$\u{a0}{}", num(v, 2))
@@ -80,6 +85,8 @@ mod testes {
         assert_eq!(num(12.0, 3), "12,000");
         assert_eq!(num(-0.0001, 2), "0,00");
         assert_eq!(qtd(30000.0), "30.000");
+        assert_eq!(estoque(30000.0), "30.000,000");
+        assert_eq!(estoque(1.5), "1,500");
         assert_eq!(data("2026-11-01"), "01/11/2026");
     }
 

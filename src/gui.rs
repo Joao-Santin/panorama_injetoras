@@ -26,6 +26,7 @@ use crate::{
     colunas::{AcaoColuna, Alvo, Coluna, ColunaNec, ColunaProd, ConfigColunas, CorColuna, Rgb},
     config,
     estrutura::{self, Estrutura, MaterialSomado, No, TipoNo},
+    filtro::{self, AcaoFiltro, Busca, Filtro, Opcao, TipoUso},
     fmt,
     historico::{self, ClienteAtivo, Registro},
     locais::{self, Locais},
@@ -103,6 +104,17 @@ pub enum OrdemNec {
 impl OrdemNec {
     const TODAS: [OrdemNec; 6] =
         [Self::CustoFalta, Self::Falta, Self::Necessidade, Self::Saldo, Self::SaldoOpsSimulacao, Self::Nome];
+
+    fn comparar(self, x: &Necessidade, y: &Necessidade) -> std::cmp::Ordering {
+        match self {
+            Self::CustoFalta => y.custo_falta().total_cmp(&x.custo_falta()).then(y.falta().total_cmp(&x.falta())),
+            Self::Falta => y.falta().total_cmp(&x.falta()),
+            Self::Necessidade => y.necessidade.total_cmp(&x.necessidade),
+            Self::Saldo => x.saldo().total_cmp(&y.saldo()),
+            Self::SaldoOpsSimulacao => x.saldo_apos_ops_e_simulacao().total_cmp(&y.saldo_apos_ops_e_simulacao()),
+            Self::Nome => x.descricao.cmp(&y.descricao),
+        }
+    }
 }
 
 impl std::fmt::Display for OrdemNec {
@@ -235,6 +247,11 @@ pub enum Message {
     SoFaltas(bool),
     OrdemNec(OrdemNec),
     ModoConfigNec(bool),
+    /// Abre (ou fecha) o painel "Filtro de busca" da tabela.
+    ModoFiltro(Tabela, bool),
+    Filtro(Tabela, AcaoFiltro),
+    /// Zera o filtro e desliga as opções "Somente..." e "Juntar locais" da tabela.
+    LimparFiltros(Tabela),
     ModoSimulacoes(bool),
     SimBusca(String),
     SimEscolher(i64),
@@ -408,6 +425,10 @@ pub struct App {
     ordem_nec: OrdemNec,
     config_nec: ConfigColunas<ColunaNec>,
     modo_config_nec: bool,
+    filtro_nec: Filtro,
+    modo_filtro_nec: bool,
+    filtro_prod: Filtro,
+    modo_filtro_prod: bool,
     modo_simulacoes: bool,
     simulacoes: Vec<Simulacao>,
     /// Necessidades em uso (geral ou do grupo) somadas às simulações. É o que a tabela mostra.
@@ -584,10 +605,6 @@ fn gravar_no_servidor(srv: &Servidor, pedido: Pedido) -> anyhow::Result<Resposta
     Ok(Resposta::Nada)
 }
 
-fn contem(alvo: &str, busca: &str) -> bool {
-    busca.is_empty() || alvo.to_lowercase().contains(busca)
-}
-
 impl App {
     /// Começa vazio: os dados chegam quando a conexão com o servidor abre (`Aviso::Conectado`).
     fn boot() -> (Self, Task<Message>) {
@@ -606,6 +623,10 @@ impl App {
             ordem_nec: OrdemNec::CustoFalta,
             config_nec: ConfigColunas::default(),
             modo_config_nec: false,
+            filtro_nec: Filtro::default(),
+            modo_filtro_nec: false,
+            filtro_prod: Filtro::default(),
+            modo_filtro_prod: false,
             modo_simulacoes: false,
             simulacoes: Vec::new(),
             simulado: Simulado::default(),
@@ -798,6 +819,7 @@ impl App {
             Message::ModoConfigNec(b) => {
                 self.modo_config_nec = b;
                 self.modo_simulacoes &= !b;
+                self.modo_filtro_nec &= !b;
                 if !b && self.editor_cor.as_ref().is_some_and(|e| e.tabela == Tabela::Necessidades) {
                     return self.fechar_editor_cor(true);
                 }
@@ -805,9 +827,45 @@ impl App {
             Message::ModoSimulacoes(b) => {
                 self.modo_simulacoes = b;
                 self.modo_config_nec &= !b;
+                self.modo_filtro_nec &= !b;
                 if b && self.editor_cor.as_ref().is_some_and(|e| e.tabela == Tabela::Necessidades) {
                     return self.fechar_editor_cor(true);
                 }
+            }
+            Message::ModoFiltro(tabela, b) => {
+                match tabela {
+                    Tabela::Necessidades => {
+                        self.modo_filtro_nec = b;
+                        self.modo_config_nec &= !b;
+                        self.modo_simulacoes &= !b;
+                    }
+                    Tabela::Produtos => {
+                        self.modo_filtro_prod = b;
+                        self.modo_config_prod &= !b;
+                    }
+                }
+                if b && self.editor_cor.as_ref().is_some_and(|e| e.tabela == tabela) {
+                    return self.fechar_editor_cor(true);
+                }
+            }
+            Message::Filtro(Tabela::Necessidades, acao) => self.filtro_nec.aplicar(acao),
+            Message::Filtro(Tabela::Produtos, acao) => {
+                self.filtro_prod.aplicar(acao);
+                return self.ir_para_pagina_prod(0);
+            }
+            Message::LimparFiltros(Tabela::Necessidades) => {
+                self.filtro_nec.aplicar(AcaoFiltro::Limpar);
+                self.so_faltas = false;
+                if self.juntar_locais_nec {
+                    return self.update(Message::JuntarLocaisNec(false));
+                }
+            }
+            Message::LimparFiltros(Tabela::Produtos) => {
+                self.filtro_prod.aplicar(AcaoFiltro::Limpar);
+                self.so_usados = false;
+                self.so_negativos = false;
+                self.juntar_locais = false;
+                return self.ir_para_pagina_prod(0);
             }
             Message::SimBusca(s) => {
                 self.busca_sim = s;
@@ -1013,6 +1071,7 @@ impl App {
             }
             Message::ModoConfigProd(b) => {
                 self.modo_config_prod = b;
+                self.modo_filtro_prod &= !b;
                 if !b && self.editor_cor.as_ref().is_some_and(|e| e.tabela == Tabela::Produtos) {
                     return self.fechar_editor_cor(true);
                 }
@@ -1346,8 +1405,9 @@ impl App {
         self.juntar_locais.then_some(&self.locais)
     }
 
-    fn produtos_filtrados<'a>(&self, a: &'a Analise) -> Vec<&'a Produto> {
-        let busca = self.busca_prod.to_lowercase();
+    /// Cada um vem com a nota da busca por aproximação (0 com a busca vazia).
+    fn produtos_filtrados<'a>(&self, a: &'a Analise) -> Vec<(i64, &'a Produto)> {
+        let busca = Busca::nova(&self.busca_prod);
         let usados: HashSet<i64> = if self.so_usados {
             a.ops
                 .iter()
@@ -1360,13 +1420,12 @@ impl App {
         let juntar = self.locais_juntados();
         // Com os locais juntados, a linha é do item de produção e vale para todas as cópias:
         // a busca acha por qualquer uma, e "estoque negativo" olha o total.
-        let acha = |p: &Produto| {
-            contem(&p.descricao, &busca)
-                || contem(&p.codigo_proprio, &busca)
-                || contem(&p.tags.join(" "), &busca)
-                || contem(a.categoria_de(p.cod_categoria), &busca)
-                || p.codigo.to_string() == busca
+        let nota = |p: &Produto| {
+            let codigo = p.codigo.to_string();
+            let campos = [p.descricao.as_str(), &p.codigo_proprio, &codigo, a.categoria_de(p.cod_categoria)];
+            busca.nota(campos.into_iter().chain(p.tags.iter().map(String::as_str)))
         };
+        let filtro = &self.filtro_prod;
         let usado = |p: &Produto| match juntar {
             Some(l) => l.codigos(p).any(|c| usados.contains(&c)),
             None => usados.contains(&p.codigo),
@@ -1376,9 +1435,13 @@ impl App {
             .filter(|p| juntar.is_none_or(|l| !l.copias.contains(&p.codigo)))
             .filter(|p| !self.so_usados || usado(p))
             .filter(|p| !self.so_negativos || juntar.map_or(p.estoque, |l| l.total(p)) < 0.0)
-            .filter(|p| match juntar {
-                Some(l) => l.codigos(p).filter_map(|c| a.produtos.get(&c)).any(acha),
-                None => acha(p),
+            .filter(|p| filtro.aceita(&p.codigo_proprio, a.categoria_de(p.cod_categoria), &p.tags))
+            .filter_map(|p| {
+                let n = match juntar {
+                    Some(l) => l.codigos(p).filter_map(|c| a.produtos.get(&c)).filter_map(nota).max(),
+                    None => nota(p),
+                };
+                Some((n?, p))
             })
             .collect()
     }
@@ -1879,49 +1942,47 @@ impl App {
 
     fn view_necessidades<'a>(&'a self, a: &'a Analise) -> Element<'a, Message> {
         let res = self.res_necessidades(a);
-        let busca = self.busca_nec.to_lowercase();
-        let mut linhas: Vec<&'a Necessidade> = self
+        let busca = Busca::nova(&self.busca_nec);
+        let nota = |n: &Necessidade| {
+            let codigo = n.cod_insumo.to_string();
+            let campos = [n.descricao.as_str(), &n.codigo_proprio, &codigo, &n.categoria];
+            let propria = busca.nota(campos.into_iter().chain(n.tags.iter().map(String::as_str)));
+            // Com os locais juntados, acha também pelo código ou descrição das cópias.
+            let copias = self
+                .juntar_locais_nec
+                .then(|| {
+                    self.locais.codigos_de(n.cod_insumo).skip(1).filter_map(|c| a.produtos.get(&c)).filter_map(|p| {
+                        let codigo = p.codigo.to_string();
+                        busca.nota([p.descricao.as_str(), &p.codigo_proprio, &codigo])
+                    })
+                })
+                .into_iter()
+                .flatten();
+            propria.into_iter().chain(copias).max()
+        };
+        let mut linhas: Vec<(i64, &'a Necessidade)> = self
             .simulado
             .linhas
             .iter()
             .filter(|n| !n.mao_de_obra)
             .filter(|n| !self.so_faltas || n.falta() > 0.0)
-            .filter(|n| {
-                contem(&n.descricao, &busca)
-                    || contem(&n.codigo_proprio, &busca)
-                    || contem(&n.categoria, &busca)
-                    || n.tags.iter().any(|t| contem(t, &busca))
-                    || n.cod_insumo.to_string() == busca
-                    // Com os locais juntados, acha também pelo código ou descrição das cópias.
-                    || (self.juntar_locais_nec
-                        && self.locais.codigos_de(n.cod_insumo).skip(1).filter_map(|c| a.produtos.get(&c)).any(|p| {
-                            contem(&p.descricao, &busca) || contem(&p.codigo_proprio, &busca) || p.codigo.to_string() == busca
-                        }))
-            })
+            .filter(|n| self.filtro_nec.aceita(&n.codigo_proprio, &n.categoria, &n.tags))
+            .filter_map(|n| Some((nota(n)?, n)))
             .collect();
-        match self.ordem_nec {
-            OrdemNec::CustoFalta => linhas.sort_by(|x, y| {
-                y.custo_falta().total_cmp(&x.custo_falta()).then(y.falta().total_cmp(&x.falta()))
-            }),
-            OrdemNec::Falta => linhas.sort_by(|x, y| y.falta().total_cmp(&x.falta())),
-            OrdemNec::Necessidade => linhas.sort_by(|x, y| y.necessidade.total_cmp(&x.necessidade)),
-            OrdemNec::Saldo => linhas.sort_by(|x, y| x.saldo().total_cmp(&y.saldo())),
-            OrdemNec::SaldoOpsSimulacao => {
-                linhas.sort_by(|x, y| x.saldo_apos_ops_e_simulacao().total_cmp(&y.saldo_apos_ops_e_simulacao()))
-            }
-            OrdemNec::Nome => linhas.sort_by(|x, y| x.descricao.cmp(&y.descricao)),
-        }
+        // Primeiro a ordem escolhida; com texto na busca, os mais parecidos sobem (a
+        // ordenação é estável, então a escolhida desempata notas iguais).
+        linhas.sort_by(|(_, x), (_, y)| self.ordem_nec.comparar(x, y));
+        linhas.sort_by(|(x, _), (y, _)| y.cmp(x));
+        let linhas: Vec<&'a Necessidade> = linhas.into_iter().map(|(_, n)| n).collect();
         let custo_total: f64 = linhas.iter().map(|n| n.custo_falta()).sum();
 
         let filtros = row![
-            text_input("Buscar material, código, categoria ou tag...", &self.busca_nec)
+            text_input("Buscar material, código, categoria ou tag (busca aproximada)...", &self.busca_nec)
                 .on_input(Message::BuscaNec)
-                .width(340),
-            toggler(self.so_faltas).label("Somente com falta").on_toggle(Message::SoFaltas),
-            toggler(self.juntar_locais_nec).label("Juntar locais (almoxarifado...)").on_toggle(Message::JuntarLocaisNec),
-            pick_list(OrdemNec::TODAS, Some(self.ordem_nec), Message::OrdemNec),
+                .width(420),
             space::horizontal(),
             text(format!("{} materiais  ·  custo das faltas listadas: {}", linhas.len(), fmt::moeda(custo_total))).size(13),
+            botao_filtro(Tabela::Necessidades, self.modo_filtro_nec, self.ativos_nec()),
             button(text(if self.modo_simulacoes {
                 "Fechar simulações".to_string()
             } else {
@@ -1934,7 +1995,6 @@ impl App {
         ]
         .spacing(14)
         .align_y(Center);
-
         let sel = self.material_sel;
         let locais_nec = self.juntar_locais_nec.then_some(&self.locais);
         // O cabeçalho é uma tabela à parte, fora da rolagem, para não descer com a lista. As colunas
@@ -1954,6 +2014,8 @@ impl App {
             row![container(tabela).width(Fill), view_config_colunas(&self.config_nec, Tabela::Necessidades, self.editor_cor.as_ref())].spacing(12).into()
         } else if self.modo_simulacoes {
             row![container(tabela).width(Fill), self.view_simulacoes(a)].spacing(12).into()
+        } else if self.modo_filtro_nec {
+            row![container(tabela).width(Fill), self.view_filtro(a, Tabela::Necessidades)].spacing(12).into()
         } else {
             tabela.into()
         };
@@ -1970,6 +2032,113 @@ impl App {
             }
         }
         tela.into()
+    }
+
+    /// Filtros ligados na aba Necessidades (a ordem não conta).
+    fn ativos_nec(&self) -> usize {
+        self.filtro_nec.ativos() + usize::from(self.so_faltas) + usize::from(self.juntar_locais_nec)
+    }
+
+    fn ativos_prod(&self) -> usize {
+        self.filtro_prod.ativos()
+            + usize::from(self.so_usados)
+            + usize::from(self.so_negativos)
+            + usize::from(self.juntar_locais)
+    }
+
+    /// Painel lateral "Filtro de busca" das abas Necessidades e Produtos.
+    fn view_filtro<'a>(&'a self, a: &'a Analise, tabela: Tabela) -> Element<'a, Message> {
+        let (f, ativos) = match tabela {
+            Tabela::Necessidades => (&self.filtro_nec, self.ativos_nec()),
+            Tabela::Produtos => (&self.filtro_prod, self.ativos_prod()),
+        };
+        let acao = move |acao: AcaoFiltro| Message::Filtro(tabela, acao);
+
+        // Categorias e tags que existem na própria tabela.
+        let (categorias, tags): (BTreeSet<String>, BTreeSet<String>) = match tabela {
+            Tabela::Necessidades => {
+                let linhas = self.simulado.linhas.iter().filter(|n| !n.mao_de_obra);
+                (
+                    linhas.clone().map(|n| n.categoria.clone()).collect(),
+                    linhas.flat_map(|n| n.tags.iter().map(|t| t.trim().to_string())).collect(),
+                )
+            }
+            Tabela::Produtos => (
+                a.produtos.values().map(|p| a.categoria_de(p.cod_categoria).to_string()).collect(),
+                a.produtos.values().flat_map(|p| p.tags.iter().map(|t| t.trim().to_string())).collect(),
+            ),
+        };
+        let tags_livres: Vec<String> =
+            tags.into_iter().filter(|t| !t.is_empty() && !f.tags.iter().any(|x| x.eq_ignore_ascii_case(t))).collect();
+
+        let categoria = pick_list(filtro::opcoes(categorias), Some(Opcao(f.categoria.clone())), move |o: Opcao<String>| {
+            acao(AcaoFiltro::Categoria(o.0))
+        })
+        .text_size(13)
+        .width(Fill);
+        let tipo = pick_list(filtro::opcoes(TipoUso::TODOS), Some(Opcao(f.tipo)), move |o: Opcao<TipoUso>| {
+            acao(AcaoFiltro::Tipo(o.0))
+        })
+        .text_size(13)
+        .width(Fill);
+        let prefixo = text_input("Ex.: 21", &f.prefixo)
+            .on_input(move |s| acao(AcaoFiltro::Prefixo(s)))
+            .size(13)
+            .width(Fill);
+        let escolhidas = iced::widget::Row::with_children(f.tags.iter().map(|t| {
+            button(text(format!("{t}  ×")).size(12))
+                .padding([2, 8])
+                .style(button::secondary)
+                .on_press(acao(AcaoFiltro::RemoverTag(t.clone())))
+                .into()
+        }))
+        .spacing(6)
+        .wrap();
+        let nova_tag = pick_list(tags_livres, None::<String>, move |t| acao(AcaoFiltro::AdicionarTag(t)))
+            .placeholder("Adicionar tag...")
+            .text_size(13)
+            .width(Fill);
+
+        let mut col = column![
+            text("Filtro de busca").size(15).font(NEGRITO),
+            text("Vale junto com a barra de busca. Itens precisam atender a todos os campos preenchidos.")
+                .size(12)
+                .style(text::secondary),
+            campo_filtro("Categoria", categoria),
+            campo_filtro("Código próprio começa com (2 primeiros dígitos)", prefixo),
+            campo_filtro("Tipo de uso (pelo 1º dígito do código próprio)", tipo),
+            campo_filtro("Tags (palavras-chave) — precisa ter todas", column![nova_tag, escolhidas].spacing(6)),
+            rule::horizontal(1),
+        ]
+        .spacing(10);
+
+        col = match tabela {
+            Tabela::Necessidades => col.push(column![
+                campo_filtro("Ordenar", pick_list(OrdemNec::TODAS, Some(self.ordem_nec), Message::OrdemNec).text_size(13).width(Fill)),
+                toggler(self.so_faltas).label("Somente com falta").on_toggle(Message::SoFaltas),
+                toggler(self.juntar_locais_nec).label("Juntar locais (almoxarifado...)").on_toggle(Message::JuntarLocaisNec),
+            ]
+            .spacing(10)),
+            Tabela::Produtos => col.push(column![
+                toggler(self.so_usados).label("Somente itens usados nas OPs em aberto").on_toggle(Message::SoUsados),
+                toggler(self.so_negativos).label("Somente com estoque negativo").on_toggle(Message::SoNegativos),
+                toggler(self.juntar_locais).label("Juntar locais (almoxarifado...)").on_toggle(Message::JuntarLocais),
+            ]
+            .spacing(10)),
+        };
+        col = col.push(rule::horizontal(1));
+        col = col.push(
+            button(text("Limpar filtros").size(13))
+                .style(button::secondary)
+                .on_press_maybe((ativos > 0).then_some(Message::LimparFiltros(tabela))),
+        );
+
+        container(scrollable(col.padding(iced::Padding { right: 14.0, ..iced::Padding::ZERO })).height(Fill))
+            .padding(12)
+            .width(360)
+            .height(Fill)
+            .style(container::bordered_box)
+            .into()
     }
 
     /// Painel lateral: criar, ver e excluir simulações.
@@ -2725,37 +2894,52 @@ impl App {
 
     fn view_produtos<'a>(&'a self, a: &'a Analise) -> Element<'a, Message> {
         let mut todos = self.produtos_filtrados(a);
-        // O código desempata descrições iguais, para cada item ficar sempre na mesma página.
-        todos.sort_by(|x, y| x.descricao.cmp(&y.descricao).then(x.codigo.cmp(&y.codigo)));
+        // Com texto na busca, os mais parecidos vêm primeiro. O código desempata descrições
+        // iguais, para cada item ficar sempre na mesma página.
+        todos.sort_by(|(nx, x), (ny, y)| ny.cmp(nx).then(x.descricao.cmp(&y.descricao)).then(x.codigo.cmp(&y.codigo)));
         let pag = Paginacao::de(todos.len(), self.pagina_prod);
-        let linhas = todos[pag.inicio..pag.fim].to_vec();
+        let linhas: Vec<&Produto> = todos[pag.inicio..pag.fim].iter().map(|(_, p)| *p).collect();
 
         let filtros = row![
-            text_input("Buscar produto, código, categoria ou tag...", &self.busca_prod).on_input(Message::BuscaProd).width(340),
-            toggler(self.so_usados).label("Somente itens usados nas OPs em aberto").on_toggle(Message::SoUsados),
-            toggler(self.so_negativos).label("Somente com estoque negativo").on_toggle(Message::SoNegativos),
-            toggler(self.juntar_locais).label("Juntar locais (almoxarifado...)").on_toggle(Message::JuntarLocais),
+            text_input("Buscar produto, código, categoria ou tag (busca aproximada)...", &self.busca_prod)
+                .on_input(Message::BuscaProd)
+                .width(420),
             space::horizontal(),
             text(format!("{} produtos", pag.total)).size(13),
+            botao_filtro(Tabela::Produtos, self.modo_filtro_prod, self.ativos_prod()),
             botao_config_colunas(self.modo_config_prod, Message::ModoConfigProd(!self.modo_config_prod)),
         ]
         .spacing(14)
         .align_y(Center);
 
         let sel = self.produto_sel;
-        let colunas: Vec<_> = self.config_prod.visiveis().map(|c| coluna_produto(c, self.config_prod.cor_de(c), a, sel, &self.produzido_parcial, self.locais_juntados())).collect();
-        let mut lista = column![].spacing(8);
+        let locais = self.locais_juntados();
+        let coluna = |c: ColunaProd, cabecalho: Element<'a, Message>| {
+            coluna_produto(c, self.config_prod.cor_de(c), a, sel, &self.produzido_parcial, locais, cabecalho)
+        };
+        // Como na aba Necessidades: o cabeçalho é uma tabela à parte, fora da rolagem, para não
+        // descer com a lista. Com as mesmas colunas proporcionais, as duas tabelas ficam alinhadas.
+        let titulos: Vec<_> = self.config_prod.visiveis().map(|c| coluna(c, cab(c.rotulo()).into())).collect();
+        let sem_linhas: [&'a Produto; 0] = [];
+        let cabecalho = container(table::table(titulos, sem_linhas).padding(0).width(Fill))
+            .padding(iced::Padding { right: FOLGA_ROLAGEM, ..iced::Padding::ZERO })
+            .width(Fill)
+            .style(container::rounded_box);
+        let colunas: Vec<_> = self.config_prod.visiveis().map(|c| coluna(c, space().into())).collect();
+        let mut lista = column![table::table(colunas, linhas).padding(0).width(Fill)].spacing(8);
         if pag.ultima > 0 {
             lista = lista.push(view_paginacao(pag));
         }
-        lista = lista.push(table::table(colunas, linhas).padding(0).width(Fill));
+        let mut tabela = column![].spacing(8).width(Fill);
         if pag.ultima > 0 {
-            lista = lista.push(view_paginacao(pag));
+            tabela = tabela.push(view_paginacao(pag));
         }
-        let tabela = rolagem(lista).id(ID_LISTA_PRODUTOS);
+        let tabela = tabela.push(column![cabecalho, rolagem(lista).id(ID_LISTA_PRODUTOS).height(Fill)].width(Fill));
         // Em modo de configuração, o painel fica à direita da tabela (prévia ao vivo).
         let tabela: Element<'a, Message> = if self.modo_config_prod {
             row![container(tabela).width(Fill), view_config_colunas(&self.config_prod, Tabela::Produtos, self.editor_cor.as_ref())].spacing(12).into()
+        } else if self.modo_filtro_prod {
+            row![container(tabela).width(Fill), self.view_filtro(a, Tabela::Produtos)].spacing(12).into()
         } else {
             tabela.into()
         };
@@ -2786,6 +2970,24 @@ impl App {
 }
 
 // ============================================================ helpers ===
+
+/// Botão que abre o painel "Filtro de busca", com quantos filtros estão ligados.
+fn botao_filtro<'a>(tabela: Tabela, aberto: bool, ativos: usize) -> Element<'a, Message> {
+    let rotulo = match ativos {
+        0 => "Filtros".to_string(),
+        n => format!("Filtros ({n})"),
+    };
+    let estilo: EstiloBotao = if aberto || ativos > 0 { button::primary } else { button::secondary };
+    button(text(if aberto { "Fechar filtros".to_string() } else { rotulo }).size(13))
+        .style(estilo)
+        .on_press(Message::ModoFiltro(tabela, !aberto))
+        .into()
+}
+
+/// Linha do painel de filtro: rótulo em cima, campo embaixo.
+fn campo_filtro<'a>(rotulo: &'a str, campo: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    column![text(rotulo).size(12).style(text::secondary), campo.into()].spacing(4).into()
+}
 
 fn botao_config_colunas<'a>(ativo: bool, ao_clicar: Message) -> Element<'a, Message> {
     let estilo: EstiloBotao = if ativo { button::primary } else { button::secondary };
@@ -3023,9 +3225,9 @@ fn coluna_produto<'a>(
     sel: Option<i64>,
     produzido: &'a HashMap<i64, f64>,
     locais: Option<&'a Locais>,
+    titulo: Element<'a, Message>,
 ) -> table::Column<'a, 'a, &'a Produto, Message> {
     type P<'x> = &'x Produto;
-    let titulo = cab(c.rotulo()).into();
     let produzido_de = move |p: P<'a>| produzido.get(&p.codigo).copied().unwrap_or(0.0);
     // Com os locais juntados, o estoque é a soma de todos os locais.
     let estoque_de = move |p: P<'a>| locais.map_or(p.estoque, |l| l.total(p));
@@ -3344,7 +3546,7 @@ fn celula_saldo<'a>(saldo: f64) -> iced::widget::Text<'a> {
 /// Estoque do item. Com os locais juntados e o item tendo cópias, mostra cada local
 /// e o total: "Produção: 114", "Almoxarifado: 3.000", "Total: 3.114".
 fn celula_estoque_locais<'a>(locais: Option<&'a Locais>, codigo: i64, producao: f64, total: f64) -> Element<'a, Message> {
-    let valor = |v: f64| cel(fmt::qtd(v)).style(if v < 0.0 { text::danger } else { sem_cor });
+    let valor = |v: f64| cel(fmt::estoque(v)).style(if v < 0.0 { text::danger } else { sem_cor });
     let Some(outros) = locais.and_then(|l| l.outros.get(&codigo)) else {
         return valor(total).into();
     };

@@ -23,6 +23,7 @@ mod coleta;
 mod colunas;
 mod config;
 mod estrutura;
+mod filtro;
 mod fmt;
 mod gui;
 mod historico;
