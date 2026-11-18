@@ -4,7 +4,7 @@
 
 use std::{sync::OnceLock, time::Duration};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use reqwest::{
     Method,
     header::{HeaderMap, HeaderValue},
@@ -40,10 +40,32 @@ pub fn cliente_http(tempo_limite: Option<Duration>) -> Result<reqwest::blocking:
     // Codificado porque header só aceita ASCII ("João" → "Jo%C3%A3o").
     let codificado = |s: String| HeaderValue::from_str(&crate::historico::codificar(&s)).expect("codificado é ASCII");
     headers.insert("x-programa", HeaderValue::from_static(crate::historico::PROGRAMA));
-    headers.insert("x-usuario", codificado(crate::config::usuario()));
+    headers.insert("x-usuario", codificado(crate::conta::nome_em_uso()));
+    if let Some(t) = crate::conta::token()
+        && let Ok(mut valor) = HeaderValue::from_str(&format!("Bearer {t}"))
+    {
+        valor.set_sensitive(true);
+        headers.insert(reqwest::header::AUTHORIZATION, valor);
+    }
     headers.insert("x-maquina", codificado(crate::config::maquina()));
     Ok(reqwest::blocking::Client::builder().timeout(tempo_limite).default_headers(headers).build()?)
 }
+
+/// O servidor respondeu com erro. `msg` é só a mensagem dele (ex.: "Usuário ou senha incorretos.").
+#[derive(Debug)]
+pub struct ErroHttp {
+    pub status: u16,
+    pub msg: String,
+    texto: String,
+}
+
+impl std::fmt::Display for ErroHttp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.texto)
+    }
+}
+
+impl std::error::Error for ErroHttp {}
 
 pub struct Servidor {
     http: reqwest::blocking::Client,
@@ -89,7 +111,7 @@ impl Servidor {
                 .ok()
                 .and_then(|v| v["erro"].as_str().map(String::from))
                 .unwrap_or(corpo);
-            bail!("{metodo} {caminho} → {status}: {msg}");
+            return Err(ErroHttp { status: status.as_u16(), texto: format!("{metodo} {caminho} → {status}: {msg}"), msg }.into());
         }
         Ok(resp)
     }

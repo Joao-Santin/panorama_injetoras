@@ -25,6 +25,7 @@ use crate::{
     coleta::{self, Analise, DadosBrutos, Progresso},
     colunas::{AcaoColuna, Alvo, Coluna, ColunaNec, ColunaProd, ConfigColunas, CorColuna, Rgb},
     config,
+    conta::{self, Cadastro, Conta},
     estrutura::{self, Estrutura, MaterialSomado, No, TipoNo},
     filtro::{self, AcaoFiltro, Busca, Filtro, Opcao, TipoUso},
     fmt,
@@ -71,6 +72,31 @@ pub enum Aba {
     Alertas,
     Produtos,
     Configuracoes,
+}
+
+impl Aba {
+    /// Abas de dados, na ordem em que aparecem.
+    const DE_DADOS: [Aba; 6] = [Self::Resumo, Self::Necessidades, Self::MaoDeObra, Self::Ops, Self::Alertas, Self::Produtos];
+
+    /// Nome da tela nas permissões (`conta::TELAS`). Configurações é de todos.
+    fn tela(self) -> Option<&'static str> {
+        Some(match self {
+            Self::Resumo => "resumo",
+            Self::Necessidades => "necessidades",
+            Self::MaoDeObra => "mao_de_obra",
+            Self::Ops => "ops",
+            Self::Alertas => "alertas",
+            Self::Produtos => "produtos",
+            Self::Configuracoes => return None,
+        })
+    }
+}
+
+/// Tela de entrada: entrar numa conta ou pedir uma.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModoEntrada {
+    Entrar,
+    Criar,
 }
 
 /// O que o banner da aba Produtos mostra do item selecionado.
@@ -309,8 +335,25 @@ pub enum Message {
     ConfigSalvar,
     ConfigPadrao,
     ConfigSub(SubConfig),
-    ConfigUsuario(String),
-    ConfigSalvarUsuario,
+    /// Conta da sessão guardada, conferida no servidor (`None` = precisa entrar).
+    Sessao(Result<Option<Conta>, String>),
+    /// `true` = ainda não há contas: a primeira será a do administrador.
+    SemContas(Result<bool, String>),
+    VerificarDeNovo,
+    EntModo(ModoEntrada),
+    EntUsuario(String),
+    EntSenha(String),
+    EntSenha2(String),
+    EntEnviar,
+    EntRetorno(Result<Cadastro, String>),
+    Sair,
+    Contas(Result<Vec<Conta>, String>),
+    ContasAtualizar,
+    ContaTela(i64, &'static str, bool),
+    ContaAutorizar(i64, bool),
+    /// Primeiro clique pede confirmação; o segundo exclui. `None` cancela.
+    ContaExcluir(Option<i64>),
+    ContaGravada(Result<(), String>),
     HistFiltro(FiltroUsuario),
     HistMais,
     HistAtualizar,
@@ -326,6 +369,19 @@ pub enum SubConfig {
     Geral,
     Historico,
     Ativos,
+    /// Contas e telas liberadas: só o administrador.
+    Permissoes,
+}
+
+impl SubConfig {
+    /// Nome da tela nas permissões. Geral é de todos; Permissões, só do administrador.
+    fn tela(self) -> Option<&'static str> {
+        match self {
+            Self::Geral | Self::Permissoes => None,
+            Self::Historico => Some("historico"),
+            Self::Ativos => Some("ativos"),
+        }
+    }
 }
 
 /// De quem mostrar o histórico.
@@ -486,11 +542,26 @@ pub struct App {
     /// Resultado do último "Salvar" da aba Configurações (erro?, mensagem).
     cfg_status: Option<(bool, String)>,
     cfg_sub: SubConfig,
-    /// Nome de usuário em uso. Mudar refaz a conexão dos avisos (o servidor vê o nome novo).
+    /// Nome da conta em uso. Mudar refaz a conexão dos avisos (o servidor vê o nome novo).
     usuario: String,
-    /// Texto do campo de nome de usuário, como foi digitado.
-    cfg_usuario: String,
-    cfg_status_usuario: Option<(bool, String)>,
+    /// Conta que entrou. `None` = mostra a tela de entrada.
+    conta: Option<Conta>,
+    /// Conferindo no servidor a sessão guardada neste computador.
+    verificando: bool,
+    /// Ainda não há contas no servidor (`None` = não sei).
+    sem_contas: Option<bool>,
+    ent_modo: ModoEntrada,
+    ent_usuario: String,
+    ent_senha: String,
+    ent_senha2: String,
+    ent_enviando: bool,
+    /// Resultado da última tentativa (erro?, mensagem).
+    ent_status: Option<(bool, String)>,
+    /// Todas as contas (subtela Permissões; só o administrador).
+    contas: Vec<Conta>,
+    contas_erro: Option<String>,
+    /// Conta esperando a confirmação de "Excluir".
+    excluir_conta: Option<i64>,
     ip_local: Option<String>,
     historico: Vec<Registro>,
     hist_filtro: FiltroUsuario,
@@ -513,6 +584,39 @@ fn em_segundo_plano<T: Send + 'static>(
         let _ = tx.send(f().map_err(|e| format!("{e:#}")));
     });
     Task::perform(rx, move |r| msg(r.unwrap_or_else(|_| Err("a tarefa foi interrompida".into()))))
+}
+
+/// Como `em_segundo_plano`, mas o erro do servidor vem só com a mensagem dele
+/// (ex.: "Usuário ou senha incorretos."), para mostrar na tela.
+fn em_segundo_plano_curto<T: Send + 'static>(
+    f: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+    msg: fn(Result<T, String>) -> Message,
+) -> Task<Message> {
+    let (tx, rx) = oneshot::channel();
+    std::thread::spawn(move || {
+        let r = f().map_err(|e| match e.downcast_ref::<api::ErroHttp>() {
+            Some(h) => h.msg.clone(),
+            None => format!("{e:#}"),
+        });
+        let _ = tx.send(r);
+    });
+    Task::perform(rx, move |r| msg(r.unwrap_or_else(|_| Err("a tarefa foi interrompida".into()))))
+}
+
+fn verificar_sessao() -> Task<Message> {
+    em_segundo_plano(conta::verificar, Message::Sessao)
+}
+
+fn carregar_sem_contas() -> Task<Message> {
+    em_segundo_plano(conta::sem_contas, Message::SemContas)
+}
+
+fn carregar_contas() -> Task<Message> {
+    em_segundo_plano_curto(conta::listar, Message::Contas)
+}
+
+fn alterar_conta(id: i64, a: conta::Alteracao) -> Task<Message> {
+    em_segundo_plano_curto(move || conta::alterar(id, &a).map(|_| ()), Message::ContaGravada)
 }
 
 /// Dados do eGestor guardados no servidor.
@@ -667,9 +771,19 @@ impl App {
             cfg_url: config::atual().servidor_url.unwrap_or_default(),
             cfg_status: None,
             cfg_sub: SubConfig::Geral,
-            usuario: config::usuario(),
-            cfg_usuario: config::atual().usuario.unwrap_or_default(),
-            cfg_status_usuario: None,
+            usuario: conta::nome_em_uso(),
+            conta: None,
+            verificando: conta::token().is_some(),
+            sem_contas: None,
+            ent_modo: ModoEntrada::Entrar,
+            ent_usuario: config::atual().ultimo_usuario.unwrap_or_default(),
+            ent_senha: String::new(),
+            ent_senha2: String::new(),
+            ent_enviando: false,
+            ent_status: None,
+            contas: Vec::new(),
+            contas_erro: None,
+            excluir_conta: None,
             ip_local: config::ip_local(),
             historico: Vec::new(),
             hist_filtro: FiltroUsuario::Todos,
@@ -680,10 +794,16 @@ impl App {
             ativos: Vec::new(),
             ativos_erro: None,
         };
-        (app, Task::none())
+        // Com sessão guardada, confere se ainda vale; sem, mostra a tela de entrada.
+        let inicio = if app.verificando { verificar_sessao() } else { carregar_sem_contas() };
+        (app, inicio)
     }
 
+    /// Os avisos (e os dados que eles trazem) só depois de entrar numa conta.
     fn subscription(&self) -> Subscription<Message> {
+        if self.conta.is_none() {
+            return Subscription::none();
+        }
         Subscription::run_with((self.servidor.clone(), self.usuario.clone()), notificacoes::fluxo).map(Message::Aviso)
     }
 
@@ -809,7 +929,9 @@ impl App {
             }
             Message::AlternarTema => self.escuro = !self.escuro,
             Message::Aba(a) => {
-                self.aba = a;
+                if self.aba_permitida(a) {
+                    self.aba = a;
+                }
                 return self.recarregar_config_visivel();
             }
             Message::BuscaNec(s) => self.busca_nec = s,
@@ -1095,24 +1217,108 @@ impl App {
                 self.cfg_url = s;
                 self.cfg_status = None;
             }
-            Message::ConfigSalvar => self.salvar_config(),
+            Message::ConfigSalvar => return self.salvar_config(),
             Message::ConfigPadrao => {
                 self.cfg_url.clear();
-                self.salvar_config();
+                return self.salvar_config();
             }
             Message::ConfigSub(s) => {
-                self.cfg_sub = s;
+                if self.sub_permitida(s) {
+                    self.cfg_sub = s;
+                    self.excluir_conta = None;
+                }
                 return self.recarregar_config_visivel();
             }
-            Message::ConfigUsuario(s) => {
-                self.cfg_usuario = s;
-                self.cfg_status_usuario = None;
-            }
-            Message::ConfigSalvarUsuario => {
-                // As colunas são de cada usuário: com outro nome, vêm as desse usuário.
-                if self.salvar_usuario() {
-                    return carregar_colunas();
+            Message::Sessao(r) => return self.sessao(r),
+            Message::SemContas(Ok(sem)) => {
+                self.sem_contas = Some(sem);
+                if sem {
+                    self.ent_modo = ModoEntrada::Criar;
                 }
+            }
+            Message::SemContas(Err(e)) => {
+                self.sem_contas = None;
+                self.ent_status = Some((true, format!("Não consegui falar com o servidor: {e}")));
+            }
+            Message::VerificarDeNovo => {
+                self.ent_status = None;
+                if conta::token().is_some() {
+                    self.verificando = true;
+                    return verificar_sessao();
+                }
+                return carregar_sem_contas();
+            }
+            Message::EntModo(m) => {
+                self.ent_modo = m;
+                self.ent_status = None;
+            }
+            Message::EntUsuario(s) => self.ent_usuario = s,
+            Message::EntSenha(s) => self.ent_senha = s,
+            Message::EntSenha2(s) => self.ent_senha2 = s,
+            Message::EntEnviar => return self.enviar_entrada(),
+            Message::EntRetorno(r) => {
+                self.ent_enviando = false;
+                self.ent_senha.clear();
+                self.ent_senha2.clear();
+                match r {
+                    Ok(Cadastro::Entrou(c)) => {
+                        self.ent_status = None;
+                        return self.entrou(c);
+                    }
+                    Ok(Cadastro::Pendente) => {
+                        self.ent_modo = ModoEntrada::Entrar;
+                        self.sem_contas = Some(false);
+                        self.ent_status = Some((
+                            false,
+                            "Conta criada! Agora o administrador precisa autorizar o seu acesso. \
+                             Depois disso, entre com o seu usuário e senha."
+                                .into(),
+                        ));
+                    }
+                    Err(e) => self.ent_status = Some((true, e)),
+                }
+            }
+            Message::Sair => {
+                if let Err(e) = conta::sair() {
+                    self.status = Some((true, format!("Não consegui esquecer a sessão: {e:#}")));
+                }
+                self.saiu(None);
+                return carregar_sem_contas();
+            }
+            Message::Contas(Ok(lista)) => {
+                self.contas = lista;
+                self.contas_erro = None;
+            }
+            Message::Contas(Err(e)) => self.contas_erro = Some(e),
+            Message::ContasAtualizar => return carregar_contas(),
+            Message::ContaTela(id, tela, liberar) => {
+                let Some(c) = self.contas.iter_mut().find(|c| c.id == id) else { return Task::none() };
+                // Muda na hora na tela; a resposta do servidor confirma (ou desfaz, se der erro).
+                c.telas.retain(|t| t != tela);
+                if liberar {
+                    c.telas.push(tela.to_string());
+                }
+                let telas = c.telas.clone();
+                return alterar_conta(id, conta::Alteracao { telas: Some(telas), ..Default::default() });
+            }
+            Message::ContaAutorizar(id, aprovado) => {
+                if let Some(c) = self.contas.iter_mut().find(|c| c.id == id) {
+                    c.aprovado = aprovado;
+                }
+                return alterar_conta(id, conta::Alteracao { aprovado: Some(aprovado), ..Default::default() });
+            }
+            Message::ContaExcluir(None) => self.excluir_conta = None,
+            Message::ContaExcluir(Some(id)) if self.excluir_conta == Some(id) => {
+                self.excluir_conta = None;
+                self.contas.retain(|c| c.id != id);
+                return em_segundo_plano_curto(move || conta::excluir(id), Message::ContaGravada);
+            }
+            Message::ContaExcluir(Some(id)) => self.excluir_conta = Some(id),
+            Message::ContaGravada(r) => {
+                if let Err(e) = r {
+                    self.contas_erro = Some(format!("Não gravei: {e}"));
+                }
+                return carregar_contas();
             }
             Message::HistFiltro(f) => {
                 self.hist_filtro = f;
@@ -1178,6 +1384,111 @@ impl App {
             SubConfig::Geral => Task::none(),
             SubConfig::Historico => Task::batch([self.carregar_historico(false), carregar_usuarios_hist()]),
             SubConfig::Ativos => carregar_ativos(),
+            SubConfig::Permissoes => carregar_contas(),
+        }
+    }
+
+    // ------------------------------------------------------ conta ---
+
+    fn aba_permitida(&self, aba: Aba) -> bool {
+        match (aba.tela(), &self.conta) {
+            (None, _) => true,
+            (Some(t), Some(c)) => c.pode(t),
+            (Some(_), None) => false,
+        }
+    }
+
+    fn sub_permitida(&self, sub: SubConfig) -> bool {
+        match (sub, &self.conta) {
+            (_, None) => false,
+            (SubConfig::Permissoes, Some(c)) => c.admin,
+            (s, Some(c)) => s.tela().is_none_or(|t| c.pode(t)),
+        }
+    }
+
+    /// Se a aba (ou a subtela) aberta deixou de ser permitida, vai para a primeira que é.
+    fn ajustar_aba(&mut self) {
+        if !self.aba_permitida(self.aba) {
+            self.aba = Aba::DE_DADOS.into_iter().find(|&a| self.aba_permitida(a)).unwrap_or(Aba::Configuracoes);
+        }
+        if !self.sub_permitida(self.cfg_sub) {
+            self.cfg_sub = SubConfig::Geral;
+        }
+    }
+
+    /// Resposta da conferência da sessão (ao abrir, ao trocar de servidor ou
+    /// quando o administrador muda alguma conta).
+    fn sessao(&mut self, r: Result<Option<Conta>, String>) -> Task<Message> {
+        self.verificando = false;
+        match r {
+            Ok(Some(c)) => self.entrou(c),
+            Ok(None) => {
+                let aviso = self.conta.as_ref().map(|_| {
+                    "Sua sessão foi encerrada: a conta foi excluída ou perdeu a autorização.".to_string()
+                });
+                self.saiu(aviso);
+                carregar_sem_contas()
+            }
+            // Já dentro: um tropeço de rede não tira ninguém do programa.
+            Err(_) if self.conta.is_some() => Task::none(),
+            Err(e) => {
+                self.ent_status = Some((true, format!("Não consegui conferir a sua sessão no servidor: {e}")));
+                Task::none()
+            }
+        }
+    }
+
+    /// Entrou (ou as permissões mudaram). Com outro nome, a conexão de avisos é
+    /// refeita e tudo é recarregado (as colunas são de cada usuário).
+    fn entrou(&mut self, c: Conta) -> Task<Message> {
+        let primeira_vez = self.conta.is_none();
+        self.usuario = c.usuario.clone();
+        let admin = c.admin;
+        self.conta = Some(c);
+        if primeira_vez {
+            self.aba = Aba::Resumo;
+            self.cfg_sub = SubConfig::Geral;
+        }
+        self.ajustar_aba();
+        if admin { carregar_contas() } else { Task::none() }
+    }
+
+    /// Volta à tela de entrada e esquece os dados lidos com a conta.
+    fn saiu(&mut self, aviso: Option<String>) {
+        self.conta = None;
+        self.usuario = conta::nome_em_uso();
+        self.contas.clear();
+        self.excluir_conta = None;
+        self.ent_modo = ModoEntrada::Entrar;
+        self.ent_usuario = config::atual().ultimo_usuario.unwrap_or_default();
+        self.ent_status = aviso.map(|a| (true, a));
+        self.limpar_dados();
+    }
+
+    fn enviar_entrada(&mut self) -> Task<Message> {
+        if self.ent_enviando {
+            return Task::none();
+        }
+        let usuario = self.ent_usuario.trim().to_string();
+        let senha = self.ent_senha.clone();
+        let erro = match self.ent_modo {
+            _ if usuario.is_empty() => Some("Informe o usuário."),
+            _ if senha.is_empty() => Some("Informe a senha."),
+            ModoEntrada::Criar if senha.chars().count() < 4 => Some("A senha deve ter pelo menos 4 caracteres."),
+            ModoEntrada::Criar if senha != self.ent_senha2 => Some("As senhas não são iguais."),
+            _ => None,
+        };
+        if let Some(e) = erro {
+            self.ent_status = Some((true, e.into()));
+            return Task::none();
+        }
+        self.ent_enviando = true;
+        self.ent_status = None;
+        match self.ent_modo {
+            ModoEntrada::Entrar => {
+                em_segundo_plano_curto(move || conta::entrar(&usuario, &senha).map(Cadastro::Entrou), Message::EntRetorno)
+            }
+            ModoEntrada::Criar => em_segundo_plano_curto(move || conta::cadastrar(&usuario, &senha), Message::EntRetorno),
         }
     }
 
@@ -1196,22 +1507,6 @@ impl App {
             },
             Message::Historico,
         )
-    }
-
-    /// Devolve se salvou.
-    fn salvar_usuario(&mut self) -> bool {
-        let nome = self.cfg_usuario.trim().to_string();
-        let mut nova = config::atual();
-        nova.usuario = (!nome.is_empty()).then_some(nome);
-        if let Err(e) = config::salvar(nova.clone()) {
-            self.cfg_status_usuario = Some((true, format!("Não salvei: {e:#}")));
-            return false;
-        }
-        self.cfg_usuario = nova.usuario.unwrap_or_default();
-        // A conexão de avisos é refeita com o nome novo (ela é quem aparece em "Usuários ativos").
-        self.usuario = config::usuario();
-        self.cfg_status_usuario = Some((false, format!("Salvo. As próximas ações serão registradas como \"{}\", e as colunas passam a ser as desse usuário.", self.usuario)));
-        true
     }
 
     /// Envia ao servidor a configuração de colunas da tabela.
@@ -1287,29 +1582,44 @@ impl App {
     }
 
     /// Grava as configurações. Se o endereço do servidor mudou, descarta os dados
-    /// do servidor antigo; a nova conexão de avisos recarrega tudo ao abrir.
-    fn salvar_config(&mut self) {
+    /// do servidor antigo e confere a sessão no novo (cada servidor tem as suas
+    /// contas); a nova conexão de avisos recarrega tudo ao abrir.
+    fn salvar_config(&mut self) -> Task<Message> {
         let url = match config::normalizar_url(&self.cfg_url) {
             Ok(u) => u,
             Err(e) => {
                 self.cfg_status = Some((true, format!("Não salvei: {e}")));
-                return;
+                return Task::none();
             }
         };
         let mut nova = config::atual();
         nova.servidor_url = url;
         if let Err(e) = config::salvar(nova.clone()) {
             self.cfg_status = Some((true, format!("Não salvei: {e:#}")));
-            return;
+            return Task::none();
         }
         self.cfg_url = nova.servidor_url.unwrap_or_default();
         let servidor = api::url_servidor();
         if servidor == self.servidor {
             self.cfg_status = Some((false, "Configurações salvas.".into()));
-            return;
+            return Task::none();
         }
         self.servidor = servidor;
         self.ip_local = config::ip_local();
+        self.limpar_dados();
+        self.cfg_status = Some((false, format!("Configurações salvas. Conectando a {}...", self.servidor)));
+        self.ent_status = None;
+        self.sem_contas = None;
+        if conta::token().is_some() {
+            self.verificando = self.conta.is_none();
+            verificar_sessao()
+        } else {
+            carregar_sem_contas()
+        }
+    }
+
+    /// Esquece os dados lidos do servidor (trocou de servidor ou saiu da conta).
+    fn limpar_dados(&mut self) {
         self.historico.clear();
         self.hist_usuarios.clear();
         self.ativos.clear();
@@ -1319,8 +1629,11 @@ impl App {
         self.servidor_sem_dados = false;
         self.buscando_trello = false;
         self.status = None;
+        self.trello = Arc::default();
+        self.simulacoes.clear();
+        self.lancamentos.clear();
+        self.confirmacoes = None;
         self.recalcular_grupo();
-        self.cfg_status = Some((false, format!("Configurações salvas. Conectando a {}...", self.servidor)));
     }
 
     fn aviso(&mut self, aviso: Aviso) -> Task<Message> {
@@ -1383,6 +1696,9 @@ impl App {
                     Task::batch([self.carregar_historico(false), carregar_usuarios_hist()])
                 }
                 "clientes" if self.aba == Aba::Configuracoes && self.cfg_sub == SubConfig::Ativos => carregar_ativos(),
+                // O administrador mudou alguma conta: relê a própria (permissões valem na hora).
+                // A lista de contas do administrador é relida na resposta (`entrou`).
+                "contas" => verificar_sessao(),
                 _ => Task::none(),
             },
         }
@@ -1486,6 +1802,9 @@ impl App {
     // ============================================================ view ===
 
     fn view(&self) -> Element<'_, Message> {
+        if self.conta.is_none() {
+            return self.view_entrada();
+        }
         let corpo: Element<'_, Message> = match &self.analise {
             _ if self.aba == Aba::Configuracoes => self.view_configuracoes(),
             None if self.coletando.is_some() => {
@@ -1519,9 +1838,14 @@ impl App {
     }
 
     fn view_cabecalho(&self) -> Element<'_, Message> {
+        let quem = match &self.conta {
+            Some(c) if c.admin => format!("{} (administrador)", c.usuario),
+            Some(c) => c.usuario.clone(),
+            None => String::new(),
+        };
         let sub = match &self.analise {
-            Some(a) => format!("Dados coletados em {}  ·  servidor {}", a.gerado_em, self.servidor),
-            None => format!("Sem dados  ·  servidor {}", self.servidor),
+            Some(a) => format!("Dados coletados em {}  ·  servidor {}  ·  {quem}", a.gerado_em, self.servidor),
+            None => format!("Sem dados  ·  servidor {}  ·  {quem}", self.servidor),
         };
         let topo = row![
             column![
@@ -1570,14 +1894,26 @@ impl App {
         col.into()
     }
 
-    /// Sem dados, só Resumo (a tela de "nenhum dado") e Configurações.
+    /// Contas esperando o administrador autorizar.
+    fn pendentes(&self) -> usize {
+        self.contas.iter().filter(|c| !c.aprovado).count()
+    }
+
+    /// Sem dados, só Resumo (a tela de "nenhum dado") e Configurações. Só as abas
+    /// que a conta pode abrir.
     fn view_abas(&self, a: Option<&Analise>) -> Element<'_, Message> {
         let abas = match a {
             Some(a) => self.abas_com_dados(a),
             None => vec![(Aba::Resumo, "Resumo".to_string())],
         };
+        let configuracoes = match self.pendentes() {
+            0 => "Configurações".to_string(),
+            1 => "Configurações · 1 conta para autorizar".to_string(),
+            n => format!("Configurações · {n} contas para autorizar"),
+        };
         let mut r = row![].spacing(4);
-        for (aba, rotulo) in abas.into_iter().chain([(Aba::Configuracoes, "Configurações".to_string())]) {
+        let abas = abas.into_iter().filter(|(aba, _)| self.aba_permitida(*aba));
+        for (aba, rotulo) in abas.chain([(Aba::Configuracoes, configuracoes)]) {
             let estilo: EstiloBotao = if self.aba == aba { button::primary } else { button::text };
             r = r.push(button(text(rotulo).size(14)).padding([6, 14]).style(estilo).on_press(Message::Aba(aba)));
         }
@@ -1624,9 +1960,13 @@ impl App {
             (SubConfig::Geral, "Geral".to_string()),
             (SubConfig::Historico, "Histórico".to_string()),
             (SubConfig::Ativos, format!("Usuários ativos{}", if self.ativos.is_empty() { String::new() } else { format!(" ({})", self.ativos.len()) })),
+            (SubConfig::Permissoes, match self.pendentes() {
+                0 => "Permissões".to_string(),
+                n => format!("Permissões ({n} para autorizar)"),
+            }),
         ];
         let mut abas = row![].spacing(4);
-        for (sub, rotulo) in subs {
+        for (sub, rotulo) in subs.into_iter().filter(|(s, _)| self.sub_permitida(*s)) {
             let estilo: EstiloBotao = if self.cfg_sub == sub { button::secondary } else { button::text };
             abas = abas.push(button(text(rotulo).size(13)).padding([4, 12]).style(estilo).on_press(Message::ConfigSub(sub)));
         }
@@ -1634,8 +1974,202 @@ impl App {
             SubConfig::Geral => self.view_config_geral(),
             SubConfig::Historico => self.view_config_historico(),
             SubConfig::Ativos => self.view_config_ativos(),
+            SubConfig::Permissoes => self.view_config_permissoes(),
         };
         column![abas, corpo].spacing(12).into()
+    }
+
+    /// Todas as contas: autorizar, escolher as telas de cada uma, excluir.
+    fn view_config_permissoes(&self) -> Element<'_, Message> {
+        let mut col = column![
+            row![
+                text("Contas do Panorama").size(15).font(NEGRITO),
+                space::horizontal(),
+                button(text("Atualizar").size(12)).padding([4, 10]).style(button::secondary).on_press(Message::ContasAtualizar),
+            ]
+            .align_y(Center),
+            text(
+                "Quem cria uma conta só entra depois que você autorizar, e abre só as telas marcadas. \
+                 As mudanças valem na hora, inclusive para quem está com o programa aberto."
+            )
+            .size(12)
+            .style(text::secondary),
+        ]
+        .spacing(8);
+        if let Some(e) = &self.contas_erro {
+            col = col.push(text(e.as_str()).size(13).style(text::danger));
+        }
+
+        let mut linhas = column![].spacing(6);
+        for c in &self.contas {
+            let (situacao, estilo): (&str, EstiloTexto) = match (c.admin, c.aprovado) {
+                (true, _) => ("Administrador", text::primary),
+                (false, true) => ("Autorizado", text::success),
+                (false, false) => ("Aguardando autorização", text::warning),
+            };
+            let mut acoes = row![].spacing(6).align_y(Center);
+            if !c.admin {
+                let id = c.id;
+                acoes = acoes.push(if c.aprovado {
+                    button(text("Tirar autorização").size(12))
+                        .padding([4, 10])
+                        .style(button::secondary)
+                        .on_press(Message::ContaAutorizar(id, false))
+                } else {
+                    button(text("Autorizar").size(12)).padding([4, 10]).style(button::success).on_press(Message::ContaAutorizar(id, true))
+                });
+                acoes = acoes.push(if self.excluir_conta == Some(id) {
+                    row![
+                        button(text("Confirmar exclusão").size(12))
+                            .padding([4, 10])
+                            .style(button::danger)
+                            .on_press(Message::ContaExcluir(Some(id))),
+                        button(text("Cancelar").size(12)).padding([4, 10]).style(button::text).on_press(Message::ContaExcluir(None)),
+                    ]
+                    .spacing(6)
+                } else {
+                    row![
+                        button(text(if c.aprovado { "Excluir" } else { "Recusar" }).size(12))
+                            .padding([4, 10])
+                            .style(button::text)
+                            .on_press(Message::ContaExcluir(Some(id)))
+                    ]
+                });
+            }
+            let topo = row![
+                column![
+                    text(c.usuario.as_str()).size(15).font(NEGRITO),
+                    text(format!("Criada em {}", historico::hora_local(&c.criado_em))).size(11).style(text::secondary),
+                ]
+                .spacing(2)
+                .width(260),
+                text(situacao).size(13).style(estilo).width(200),
+                space::horizontal(),
+                acoes,
+            ]
+            .spacing(10)
+            .align_y(Center);
+
+            let mut telas = row![text("Telas:").size(12).style(text::secondary)].spacing(14).align_y(Center);
+            for (id_tela, nome) in conta::TELAS {
+                let mut marcador = checkbox(c.pode(id_tela)).label(nome).text_size(12);
+                if !c.admin {
+                    let id = c.id;
+                    marcador = marcador.on_toggle(move |v| Message::ContaTela(id, id_tela, v));
+                }
+                telas = telas.push(marcador);
+            }
+            let telas: Element<'_, Message> = if c.admin {
+                column![telas, text("O administrador sempre abre todas as telas, inclusive Permissões.").size(11).style(text::secondary)]
+                    .spacing(4)
+                    .into()
+            } else {
+                telas.wrap().into()
+            };
+            linhas = linhas.push(container(column![topo, telas].spacing(10)).padding([10, 12]).style(container::rounded_box));
+        }
+        if self.contas.is_empty() && self.contas_erro.is_none() {
+            linhas = linhas.push(text("Carregando...").size(13).style(text::secondary));
+        }
+        col.push(scrollable(linhas.padding(iced::Padding::ZERO.right(FOLGA_ROLAGEM))).height(Fill)).into()
+    }
+
+    /// Antes de entrar: entrar numa conta, ou criar uma (a primeira é a do administrador).
+    fn view_entrada(&self) -> Element<'_, Message> {
+        let titulo = column![
+            text("Panorama de Injetados").size(26).font(NEGRITO),
+            text("Necessidades de materiais das OPs em aberto — eGestor").size(13).style(text::secondary),
+        ]
+        .spacing(2);
+
+        if self.verificando {
+            let c = column![titulo, text(format!("Conferindo a sessão em {}...", self.servidor)).size(14)].spacing(16);
+            return center(container(c).padding(24).max_width(460).style(container::rounded_box)).into();
+        }
+
+        let primeira = self.sem_contas == Some(true);
+        let criar = self.ent_modo == ModoEntrada::Criar;
+        let mut c = column![titulo].spacing(12);
+        if primeira {
+            c = c.push(
+                text("Ainda não há nenhuma conta. A conta criada agora será a do administrador: entra direto e é quem autoriza as próximas.")
+                    .size(13)
+                    .style(text::warning),
+            );
+        } else {
+            let aba = |rotulo: &'static str, modo: ModoEntrada| {
+                let estilo: EstiloBotao = if self.ent_modo == modo { button::secondary } else { button::text };
+                button(text(rotulo).size(13)).padding([4, 12]).style(estilo).on_press(Message::EntModo(modo))
+            };
+            c = c.push(row![aba("Entrar", ModoEntrada::Entrar), aba("Criar conta", ModoEntrada::Criar)].spacing(4));
+            if criar {
+                c = c.push(
+                    text("Depois de criar, o administrador precisa autorizar a sua conta antes do primeiro acesso.")
+                        .size(12)
+                        .style(text::secondary),
+                );
+            }
+        }
+
+        let campo = |rotulo: &'static str, valor: &str, ao_mudar: fn(String) -> Message, segredo: bool| {
+            column![
+                text(rotulo).size(12).style(text::secondary),
+                text_input("", valor).on_input(ao_mudar).on_submit(Message::EntEnviar).secure(segredo).padding(8),
+            ]
+            .spacing(4)
+        };
+        c = c.push(campo("Usuário", &self.ent_usuario, Message::EntUsuario, false));
+        c = c.push(campo("Senha", &self.ent_senha, Message::EntSenha, true));
+        if criar {
+            c = c.push(campo("Repita a senha", &self.ent_senha2, Message::EntSenha2, true));
+        }
+        let rotulo = match (self.ent_enviando, criar, primeira) {
+            (true, _, _) => "Aguarde...",
+            (false, true, true) => "Criar conta de administrador",
+            (false, true, false) => "Criar conta",
+            (false, false, _) => "Entrar",
+        };
+        c = c.push(
+            button(text(rotulo).size(14).width(Fill).align_x(Center))
+                .width(Fill)
+                .padding(10)
+                .style(button::primary)
+                .on_press_maybe((!self.ent_enviando).then_some(Message::EntEnviar)),
+        );
+        if let Some((erro, msg)) = &self.ent_status {
+            let estilo: EstiloTexto = if *erro { text::danger } else { text::success };
+            c = c.push(text(msg.as_str()).size(13).style(estilo));
+            if *erro {
+                c = c.push(
+                    button(text("Tentar de novo").size(12)).padding([4, 10]).style(button::secondary).on_press(Message::VerificarDeNovo),
+                );
+            }
+        }
+
+        // O endereço do servidor também fica aqui: sem ele não dá para entrar.
+        let digitado = config::normalizar_url(&self.cfg_url);
+        let mudou = digitado.as_ref().is_ok_and(|u| *u != config::atual().servidor_url);
+        let mut servidor = column![
+            text(format!("Servidor: {}", self.servidor)).size(12).style(text::secondary),
+            row![
+                text_input(&format!("Vazio = {}", config::url_padrao()), &self.cfg_url)
+                    .on_input(Message::ConfigUrl)
+                    .on_submit(Message::ConfigSalvar)
+                    .size(12),
+                button(text("Salvar").size(12)).padding([4, 10]).style(button::secondary).on_press_maybe(mudou.then_some(Message::ConfigSalvar)),
+            ]
+            .spacing(6)
+            .align_y(Center),
+        ]
+        .spacing(4);
+        if let Err(e) = &digitado {
+            servidor = servidor.push(text(format!("Endereço inválido: {e}")).size(12).style(text::warning));
+        }
+        c = c.push(rule::horizontal(1)).push(servidor);
+
+        // A rolagem ocupa a largura toda: o cartão é centralizado dentro dela.
+        let cartao = container(c).padding(24).max_width(460).style(container::rounded_box);
+        center(scrollable(container(cartao).center_x(Fill))).padding(16).into()
     }
 
     fn view_config_historico(&self) -> Element<'_, Message> {
@@ -1791,35 +2325,38 @@ impl App {
             servidor = servidor.push(text(msg.as_str()).size(13).style(estilo));
         }
 
-        let nome_digitado = self.cfg_usuario.trim();
-        let mudou_nome = Some(nome_digitado).filter(|n| !n.is_empty()).map(String::from) != config::atual().usuario;
-        let mut usuario = column![
-            text("Usuário").size(18).font(NEGRITO),
-            text("Nome de quem usa o programa neste computador. É o que aparece no histórico e em Usuários ativos, e cada usuário tem a sua configuração de colunas.")
-                .size(13)
-                .style(text::secondary),
+        let papel = match &self.conta {
+            Some(c) if c.admin => "Administrador: abre todas as telas e autoriza as contas em Configurações → Permissões.".to_string(),
+            Some(c) => {
+                let telas: Vec<&str> = c.telas.iter().map(|t| conta::nome_da_tela(t)).collect();
+                if telas.is_empty() {
+                    "Nenhuma tela liberada ainda: peça ao administrador.".to_string()
+                } else {
+                    format!("Telas liberadas: {}.", telas.join(", "))
+                }
+            }
+            None => String::new(),
+        };
+        let usuario = column![
+            text("Conta").size(18).font(NEGRITO),
             row![
-                text_input(&format!("Vazio = usuário do Windows ({})", config::usuario_windows()), &self.cfg_usuario)
-                    .on_input(Message::ConfigUsuario)
-                    .on_submit(Message::ConfigSalvarUsuario)
-                    .width(420),
-                button("Salvar").style(button::primary).on_press_maybe(mudou_nome.then_some(Message::ConfigSalvarUsuario)),
+                text(format!("Conectado como {}", self.usuario)).size(15),
+                space::horizontal(),
+                button("Sair da conta").style(button::secondary).on_press(Message::Sair),
             ]
-            .spacing(8)
             .align_y(Center),
+            text(papel).size(13).style(text::secondary),
+            text("É o nome que aparece no histórico e em Usuários ativos, e cada conta tem a sua configuração de colunas.")
+                .size(12)
+                .style(text::secondary),
             text(format!(
-                "Em uso: {}  ·  Computador: {}  ·  IP: {}",
-                self.usuario,
+                "Computador: {}  ·  IP: {}",
                 config::maquina(),
                 self.ip_local.as_deref().unwrap_or("não identificado"),
             ))
             .size(13),
         ]
         .spacing(8);
-        if let Some((erro, msg)) = &self.cfg_status_usuario {
-            let estilo: EstiloTexto = if *erro { text::danger } else { text::success };
-            usuario = usuario.push(text(msg.as_str()).size(13).style(estilo));
-        }
 
         let rodape = text(format!("Configurações deste computador, guardadas em {}", config::caminho().display()))
             .size(12)

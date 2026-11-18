@@ -111,8 +111,38 @@ pub fn descrever(r: &Registro, produtos: Option<&HashMap<i64, Produto>>) -> Stri
             format!("Pediu atualização do {fonte}{ja}")
         }
         "colunas" => colunas::descrever_mudanca(d["tabela"].as_str().unwrap_or(""), &d["antes"], &d["depois"]),
+        "conta_criada" if d["admin"] == true => "Criou a conta de administrador".to_string(),
+        "conta_criada" => format!("Pediu uma conta: {}", d["usuario"].as_str().unwrap_or("?")),
+        "entrou" => "Entrou no programa".to_string(),
+        "conta_excluida" => format!("Excluiu a conta {}", d["usuario"].as_str().unwrap_or("?")),
+        "conta_alterada" => descrever_conta_alterada(d),
         outra => format!("{outra}: {d}"),
     }
+}
+
+/// Ex.: "Autorizou Ana; liberou Produtos; bloqueou Alertas".
+fn descrever_conta_alterada(d: &Value) -> String {
+    let usuario = d["usuario"].as_str().unwrap_or("?");
+    let telas = |v: &Value| -> Vec<String> {
+        v.as_array().into_iter().flatten().filter_map(Value::as_str).map(String::from).collect()
+    };
+    let (antes, depois) = (telas(&d["telas"]["antes"]), telas(&d["telas"]["depois"]));
+    let nomes = |lista: Vec<&String>| lista.iter().map(|t| crate::conta::nome_da_tela(t)).collect::<Vec<_>>().join(", ");
+    let mut partes = Vec::new();
+    match (d["aprovado"]["antes"].as_bool(), d["aprovado"]["depois"].as_bool()) {
+        (Some(false), Some(true)) => partes.push(format!("Autorizou {usuario}")),
+        (Some(true), Some(false)) => partes.push(format!("Tirou a autorização de {usuario}")),
+        _ => partes.push(format!("Permissões de {usuario}")),
+    }
+    let liberou: Vec<&String> = depois.iter().filter(|t| !antes.contains(t)).collect();
+    let bloqueou: Vec<&String> = antes.iter().filter(|t| !depois.contains(t)).collect();
+    if !liberou.is_empty() {
+        partes.push(format!("liberou {}", nomes(liberou)));
+    }
+    if !bloqueou.is_empty() {
+        partes.push(format!("bloqueou {}", nomes(bloqueou)));
+    }
+    partes.join("; ")
 }
 
 #[cfg(test)]
@@ -148,6 +178,12 @@ mod testes {
             descrever(&reg("simulacao_criada", json!({"cod_produto": 9, "quantidade": 100.0})), None),
             "Criou simulação: 100 × produto 9"
         );
+        let alterada = json!({
+            "usuario": "Ana",
+            "aprovado": {"antes": false, "depois": true},
+            "telas": {"antes": ["resumo", "alertas"], "depois": ["resumo", "produtos"]},
+        });
+        assert_eq!(descrever(&reg("conta_alterada", alterada), None), "Autorizou Ana; liberou Produtos; bloqueou Alertas");
     }
 
     #[test]

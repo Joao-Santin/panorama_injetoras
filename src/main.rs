@@ -7,6 +7,10 @@
 //! Uso:
 //!   cargo run --release            → interface gráfica (iced)
 //!   cargo run --release -- --cli   → só lê os dados do servidor e gera a planilha Excel
+//!                                    (precisa ter entrado numa conta pela interface antes)
+//!
+//! Só usa o programa quem tem conta (veja `conta.rs`): a primeira conta criada é a
+//! do administrador; as outras esperam ele autorizar e abrem só as telas liberadas.
 //!
 //! Variáveis de ambiente (opcionais; também lidas do `.env`, veja `.env.example`):
 //!   BIPLAS_SERVER_URL  endereço do servidor (padrão: http://localhost:3000); o definido na
@@ -22,6 +26,7 @@ mod calculo;
 mod coleta;
 mod colunas;
 mod config;
+mod conta;
 mod estrutura;
 mod filtro;
 mod fmt;
@@ -66,8 +71,13 @@ fn main() {
 }
 
 fn executar_cli() -> Result<()> {
-    let srv = api::Servidor::new()?;
     println!("Servidor: {}", api::url_servidor());
+    // Usa a sessão de quem entrou na interface gráfica neste computador.
+    let Some(c) = conta::verificar()? else {
+        anyhow::bail!("Abra o programa (sem --cli) e entre com uma conta autorizada antes de usar o --cli.");
+    };
+    println!("Conta: {}", c.usuario);
+    let srv = api::Servidor::new()?;
     let Some(brutos) = coleta::carregar(&srv)? else {
         anyhow::bail!("O servidor ainda não terminou nenhuma sincronização do eGestor. Tente de novo em alguns minutos.");
     };
